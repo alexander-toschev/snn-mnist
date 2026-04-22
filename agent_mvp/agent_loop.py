@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import selectors
 import subprocess
 import sys
 import time
-import selectors
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -199,18 +199,27 @@ def _stream_subprocess(cmd: List[str], cwd: str) -> tuple[int, str, str]:
                 print(line, end="", file=sys.stderr, flush=True)
 
         if proc.poll() is not None:
-            # Drain remaining buffered lines.
-            for stream, bucket in ((proc.stdout, stdout_chunks), (proc.stderr, stderr_chunks)):
+            for stream, bucket, target in (
+                (proc.stdout, stdout_chunks, sys.stdout),
+                (proc.stderr, stderr_chunks, sys.stderr),
+            ):
                 if stream is None:
                     continue
                 rest = stream.read()
                 if rest:
                     bucket.append(rest)
-                    target = sys.stdout if bucket is stdout_chunks else sys.stderr
                     print(rest, end="", file=target, flush=True)
             break
 
     return proc.wait(), "".join(stdout_chunks), "".join(stderr_chunks)
+
+
+def _try_read_latest_summary(outdir: Path) -> Dict[str, Any] | None:
+    path = outdir / "registry.jsonl"
+    if not path.exists():
+        return None
+    rows = load_jsonl(path)
+    return rows[-1] if rows else None
 
 
 def run_budget(
@@ -282,10 +291,18 @@ def run_budget(
         }
         session_rows.append(row)
 
+        latest = _try_read_latest_summary(outdir)
         if returncode == 0:
             failures = 0
             print("-" * 100, flush=True)
             print(f"[agent] run {idx}/{total} finished OK in {elapsed:.1f}s", flush=True)
+            if latest and latest.get("status") == "ok":
+                print(
+                    f"[agent] best_readout={latest.get('best_readout_name')} acc={latest.get('best_readout_acc')} "
+                    f"spikes={latest.get('summary', {}).get('spikes_per_sample')} "
+                    f"energy={latest.get('summary', {}).get('energy_proxy_per_sample')}",
+                    flush=True,
+                )
         else:
             failures += 1
             print("-" * 100, flush=True)
@@ -293,6 +310,8 @@ def run_budget(
                 f"[agent] run {idx}/{total} FAILED in {elapsed:.1f}s | returncode={returncode} | consecutive_failures={failures}",
                 flush=True,
             )
+            if latest and latest.get("status") == "failed":
+                print(f"[agent] error: {latest.get('error_type')}: {latest.get('error')}", flush=True)
             if failures >= max_failures:
                 print(f"[agent] stopping early: reached max_failures={max_failures}", flush=True)
                 break
@@ -314,10 +333,19 @@ def main() -> None:
     parser.add_argument("--outdir", default="runs_agent")
     parser.add_argument("--budget", type=int, default=5)
     parser.add_argument("--mode", choices=["suggest", "run"], default="suggest")
-    parser.add_argument("--live-output", dest="live_output", action="store_true", default=True,
-                        help="Stream child experiment output in real time (default: on)")
-    parser.add_argument("--no-live-output", dest="live_output", action="store_false",
-                        help="Do not stream child experiment output")
+    parser.add_argument(
+        "--live-output",
+        dest="live_output",
+        action="store_true",
+        default=True,
+        help="Stream child experiment output in real time (default: on)",
+    )
+    parser.add_argument(
+        "--no-live-output",
+        dest="live_output",
+        action="store_false",
+        help="Do not stream child experiment output",
+    )
     args = parser.parse_args()
 
     policy = load_policy(args.policy)

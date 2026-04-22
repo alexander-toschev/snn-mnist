@@ -122,10 +122,14 @@ def _set_tensor_attr(obj, name: str, value):
 
 
 def _move_layer_state_(layer, device: torch.device) -> None:
+    # NOTE: BindsNet layers can keep some runtime scalars/tensors (e.g. dt) on CPU.
+    # That can later cause device-mismatch errors (e.g. masked_fill_) when the layer
+    # state is on CUDA. We proactively move all known state tensors to the target device.
     for name in (
         "s", "x", "v", "refrac_count", "trace", "summed",
         "rest", "v_rest", "reset", "v_reset", "refrac",
-        "thresh", "v_thresh", "tc_decay", "tau"
+        "thresh", "v_thresh", "tc_decay", "tau",
+        "dt",
     ):
         x = getattr(layer, name, None)
         if torch.is_tensor(x):

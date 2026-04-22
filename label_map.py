@@ -53,10 +53,20 @@ def build_label_map(net, input_layer, lif_layer, encoder, n_calib: int = 2000, T
     usage = torch.zeros((lif_layer.n,), dtype=torch.long)
     wins  = torch.zeros((lif_layer.n, 10), dtype=torch.long)
 
+    # Ensure inputs are on the same device as the network runtime.
+    # BindsNet will error if self.x and mask self.s are on different devices.
+    try:
+        dev = next(net.layers.values()).s.device  # type: ignore[attr-defined]
+    except Exception:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     for i in idxs:
         torch.manual_seed(seed + i)
-        x = ds_train[i]["image"]; y = int(ds_train[i]["label"])
+        x = ds_train[i]["image"].to(dev)
+        y = int(ds_train[i]["label"])
         spikes_in = encoder(x)
+        if torch.is_tensor(spikes_in):
+            spikes_in = spikes_in.to(dev)
         net.run(inputs={"Input": spikes_in}, time=T)
 
         s = lif_mon.get("s")         # [T,1,N]
