@@ -336,6 +336,8 @@ def collect_counts_plus_fast(
     n_samples: int,
     T: int,
     label_map,
+    *,
+    spikes_transform=None,
     vt_eval_offset: float = 0.0,
     debug_every: int = 1000,
     verify_offset: bool = True,
@@ -492,11 +494,19 @@ def collect_counts_plus_fast(
         drop_last=False,
     )
 
-    iterator = tqdm(
-        dl, desc=desc or f"Collect counts+WTA (T={T}, bs={batch_size})",
-        ncols=ncols, leave=leave, mininterval=2.0, miniters=1,
-        disable=not progress
-    )
+    # tqdm can raise BrokenPipeError when stdout is not a real TTY (background runs).
+    try:
+        iterator = tqdm(
+            dl,
+            desc=desc or f"Collect counts+WTA (T={T}, bs={batch_size})",
+            ncols=ncols,
+            leave=leave,
+            mininterval=2.0,
+            miniters=1,
+            disable=not progress,
+        )
+    except (BrokenPipeError, OSError):
+        iterator = dl
 
     write_pos = 0
 
@@ -523,24 +533,65 @@ def collect_counts_plus_fast(
         x_b = x_b.to(device, non_blocking=True)
         if (encoder_rate_boost != 1.0) and hasattr(encoder, "rate_scale"):
             spikes_in = _poisson_boost_batch(x_b, T, getattr(encoder, "rate_scale", 1.0), encoder_rate_boost, device)  # [T,B,784]
+            if spikes_transform is not None:
+                spikes_in = spikes_transform(spikes_in)
         else:
             spikes_in = encoder(x_b)  # ожидаем batch-encoder
             if torch.is_tensor(spikes_in) and spikes_in.device != device:
                 spikes_in = spikes_in.to(device, non_blocking=True)
-            # нормализация формы к [T,B,784]
-            if spikes_in.dim() == 4 and spikes_in.shape[2] == 1:   # [T,B,1,784]
-                spikes_in = spikes_in[:, :, 0, :]
-            elif spikes_in.dim() == 3:                              # [T,B,784]
+
+            # Conv-input path: accept [T,B,1,28,28] as-is.
+            if torch.is_tensor(spikes_in) and spikes_in.dim() == 5:
+                # expected [T,B,C,H,W]
                 pass
             else:
-                raise RuntimeError(f"Unexpected spikes_in shape: {tuple(spikes_in.shape)}")
+                # Optional transform (e.g., flat->CHW).
+                if spikes_transform is not None:
+                    spikes_in = spikes_transform(spikes_in)
+
+                # If still not conv-shaped, normalize to [T,B,784] for FC nets.
+                if torch.is_tensor(spikes_in) and spikes_in.dim() == 5:
+                    pass
+                else:
+                    if spikes_in.dim() == 4 and spikes_in.shape[2] == 1:   # [T,B,1,784]
+                        spikes_in = spikes_in[:, :, 0, :]
+                    elif spikes_in.dim() == 3:                              # [T,B,784]
+                        pass
+                    else:
+                        raise RuntimeError(f"Unexpected spikes_in shape: {tuple(spikes_in.shape)}")
 
         # D) прогон
+        # Ensure net and layers are on the target device (BindsNet can keep stale CUDA tensors).
+        if hasattr(net, "to"):
+            net.to(device)
+        for l in getattr(net, "layers", {}).values():
+            if hasattr(l, "to"):
+                l.to(device)
+        for c in getattr(net, "connections", {}).values():
+            if hasattr(c, "to"):
+                c.to(device)
+
+        if step == 0:
+            try:
+                shp = tuple(spikes_in.shape) if hasattr(spikes_in, "shape") else type(spikes_in)
+                lif_dev = None
+                try:
+                    lif_dev = getattr(lif_layer, "s").device if torch.is_tensor(getattr(lif_layer, "s", None)) else None
+                except Exception:
+                    lif_dev = None
+                print(f"[collect_counts_plus_fast] spikes_in shape: {shp} | device={device} | lif.s.device={lif_dev}")
+            except Exception:
+                pass
+
         net.run(inputs={"Input": spikes_in}, time=T)
 
         # E) чтение и признаки
         s = mon.get("s")
-        if s.dim() == 4 and s.shape[2] == 1:
+        if s.dim() == 5:
+            # Conv layer: [T,B,C,H,W] -> [T,B,N]
+            Tt, Bb, Cc, Hh, Ww = s.shape
+            s = s.view(Tt, Bb, Cc * Hh * Ww)
+        elif s.dim() == 4 and s.shape[2] == 1:
             s = s[:, :, 0, :]
         elif s.dim() == 2:
             s = s[:, None, :]

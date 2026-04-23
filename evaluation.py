@@ -139,9 +139,13 @@ def probe_readouts_counts(
     Xtr_z = (Xtr_c - mu) / sd; Xte_z = (Xte_c - mu) / sd
     _, acc_counts_lin = _train_linear_readout(Xtr_z, ytr, Xte_z, yte)
 
-    # 2) PCA-whiten + Linear
-    Ztr_w, Zte_w, *_ = _pca_whiten_counts(Xtr[:, :N], Xte[:, :N], var_keep=0.95)
-    _, acc_pca_lin = _train_linear_readout(Ztr_w, ytr, Zte_w, yte)
+    # 2) PCA-whiten + Linear (can fail on degenerate covariance for small/quiet runs)
+    acc_pca_lin = None
+    try:
+        Ztr_w, Zte_w, *_ = _pca_whiten_counts(Xtr[:, :N], Xte[:, :N], var_keep=0.95)
+        _, acc_pca_lin = _train_linear_readout(Ztr_w, ytr, Zte_w, yte)
+    except Exception as e:
+        print(f"[eval] PCAwhiten skipped: {type(e).__name__}: {e}")
 
     # 3) TF-IDF + MLP
     Xtr_n, Xte_n, _, _, _ = tfidf_from_counts(Xtr[:, :N], Xte[:, :N])
@@ -149,11 +153,13 @@ def probe_readouts_counts(
         Xtr_n, ytr, Xte_n, yte, hidden=mlp_hidden, dropout=0.2,
         epochs=mlp_epochs, batch_size=256
     )
-    return {
+    out = {
         "counts_zscore+Linear": acc_counts_lin,
-        "PCAwhiten+Linear": acc_pca_lin,
         "TFIDF+MLP": acc_tfidf_mlp,
     }
+    if acc_pca_lin is not None:
+        out["PCAwhiten+Linear"] = acc_pca_lin
+    return out
 
 def eval_readouts_from_net(
     net, lif_layer, encoder, cfg, label_map=None,
@@ -164,10 +170,40 @@ def eval_readouts_from_net(
     затем гоняет probe_readouts_counts над counts и возвращает метрики.
     """
     ds_train, ds_test = make_mnist_datasets()
-    Xtr, ytr = collect_counts_plus_fast(net, lif_layer, encoder, ds_train, n_train_counts, T=cfg.time, label_map=label_map,  move_net=True, batch_size=128,
-        encoder_rate_boost=cfg.encoder_rate_boost)
-    Xte, yte = collect_counts_plus_fast(net, lif_layer, encoder, ds_test,  n_test_counts,  T=cfg.time, label_map=label_map,  move_net=True, batch_size=128,
-        encoder_rate_boost=cfg.encoder_rate_boost)
+    spikes_transform = None
+    is_conv = False
+    try:
+        # Conv LIFNodes typically have shape=(C,H,W)
+        is_conv = hasattr(lif_layer, "shape") and lif_layer.shape is not None and len(tuple(lif_layer.shape)) == 3
+    except Exception:
+        is_conv = False
+
+    if is_conv:
+        # Force conv input [T,B,1,28,28] regardless of encoder output.
+        from csnn_mnist_net import _spikes_flat_to_hw
+        dev = cfg.torch_device() if hasattr(cfg, "torch_device") else None
+        spikes_transform = (lambda sp: _spikes_flat_to_hw(sp, dev or (sp.device if hasattr(sp,'device') else "cpu")))
+
+    if label_map is None:
+        # No label_map: disable WTA-hist features.
+        label_map = [-1] * int(lif_layer.n)
+
+    dev = cfg.torch_device() if hasattr(cfg, "torch_device") else None
+
+    Xtr, ytr = collect_counts_plus_fast(
+        net, lif_layer, encoder, ds_train, n_train_counts,
+        T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
+        encoder_rate_boost=cfg.encoder_rate_boost,
+        spikes_transform=spikes_transform,
+        device=dev,
+    )
+    Xte, yte = collect_counts_plus_fast(
+        net, lif_layer, encoder, ds_test, n_test_counts,
+        T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
+        encoder_rate_boost=cfg.encoder_rate_boost,
+        spikes_transform=spikes_transform,
+        device=dev,
+    )
     N = lif_layer.n
     accs = probe_readouts_counts(Xtr, ytr, Xte, yte, n_hidden=N)
     return accs

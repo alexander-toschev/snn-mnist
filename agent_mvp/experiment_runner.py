@@ -6,6 +6,14 @@ import sys
 import traceback
 from pathlib import Path
 from typing import Any, Dict
+import time
+
+# project imports
+ROOT = Path(__file__).resolve().parent.parent
+AGENT_DIR = Path(__file__).resolve().parent
+for p in (ROOT, AGENT_DIR):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 from agent_common import (
     append_jsonl,
@@ -20,12 +28,13 @@ from agent_common import (
     write_json,
 )
 
-# project imports
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from snn_mnist_net import Cfg, run_experiment, save_snn  # noqa: E402
+from csnn_mnist_net import (
+    CSCfg,
+    build_csnn,
+    build_encoder_from_cfg as build_csnn_encoder,
+    _spikes_flat_to_hw,
+)  # noqa: E402
 from label_map import build_label_map, save_label_map  # noqa: E402
 from evaluation import eval_readouts_from_net  # noqa: E402
 
@@ -48,6 +57,14 @@ def build_cfg(overrides: Dict[str, Any]) -> Cfg:
     return Cfg(**overrides)
 
 
+def build_cs_cfg(overrides: Dict[str, Any]) -> CSCfg:
+    valid = {name for name in CSCfg.__dataclass_fields__.keys()}
+    unknown = sorted(set(overrides) - valid)
+    if unknown:
+        raise ValueError(f"Unknown CSCfg fields: {unknown}")
+    return CSCfg(**overrides)
+
+
 
 def run_single_experiment(
     overrides: Dict[str, Any],
@@ -61,7 +78,11 @@ def run_single_experiment(
     verbose: bool = True,
     progress: bool = True,
 ) -> Dict[str, Any]:
-    cfg = build_cfg(overrides)
+    arch = str(overrides.get("arch", "fc")).lower()
+    if arch == "csnn":
+        cfg = build_cs_cfg({k: v for k, v in overrides.items() if k != "arch"})
+    else:
+        cfg = build_cfg({k: v for k, v in overrides.items() if k != "arch"})
     outdir = ensure_dir(outdir)
     cfg_dict = dict(overrides)
     cfg_digest = config_hash(cfg_dict)
@@ -81,25 +102,131 @@ def run_single_experiment(
     }
     write_json(status_path, base_payload)
 
+    live_log_path = run_dir / "live.log"
+    def _status_update(**fields):
+        payload = {**read_json(status_path), **fields}
+        payload["updated_at"] = utc_now_iso()
+        write_json(status_path, payload)
+        try:
+            with open(live_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({k: payload.get(k) for k in ("status","stage","i","n","pct","eta_seconds") if k in payload}, ensure_ascii=False) + "\n")
+        except BrokenPipeError:
+            pass
+
     try:
-        train_summary, connection, lif_layer, net, encoder = run_experiment(
-            cfg, verbose=verbose, progress=progress
-        )
+        if arch == "csnn":
+            # Minimal CSNN training loop (v0): 1 conv layer + STDP.
+            from bindsnet.datasets import MNIST
+            from torchvision import transforms
+            from bindsnet.network.monitors import Monitor
+
+            net, input_layer, lif_layer, connection = build_csnn(cfg)
+            encoder = build_csnn_encoder(cfg)
+            device = cfg.torch_device()
+            # Ensure the conv input adapter is available even if label_map is skipped.
+            from csnn_mnist_net import _spikes_flat_to_hw
+
+            transform = transforms.Compose([transforms.ToTensor()])
+            ds = MNIST(root="./data", train=True, download=True, transform=transform)
+            n_train = min(int(getattr(cfg, "N", 12000)), len(ds))
+            T = int(cfg.time)
+
+            mon_X = Monitor(input_layer, state_vars=("s",), time=T)
+            mon_H = Monitor(lif_layer, state_vars=("s",), time=T)
+            net.add_monitor(mon_X, name="mon_X")
+            net.add_monitor(mon_H, name="mon_H")
+
+            S_out = 0
+            last_report = time.time()
+            _status_update(stage="train", i=0, n=int(n_train), pct=0.0)
+
+            for i in range(n_train):
+                x = ds[i]["image"].to(device)
+                spikes = encoder(x)
+                # spikes should already be [T,1,1,28,28] when encoder_out_format=TBNCHW
+                if hasattr(spikes, "dim") and spikes.dim() == 3:
+                    spikes_hw = _spikes_flat_to_hw(spikes, device)
+                else:
+                    spikes_hw = spikes
+                net.run(inputs={"Input": spikes_hw}, time=T)
+                sH = mon_H.get("s")
+                S_out += int(sH.sum().item())
+                net.reset_state_variables()
+
+                now = time.time()
+                if now - last_report >= 30:
+                    pct = 100.0 * (i + 1) / max(1, n_train)
+                    it_s = (i + 1) / max(1e-6, (now - (last_report - 30)))  # rough
+                    eta = int((n_train - (i + 1)) / max(1e-6, it_s))
+                    _status_update(stage="train", i=int(i + 1), n=int(n_train), pct=float(pct), eta_seconds=int(eta))
+                    last_report = now
+
+            spikes_per_sample = float(S_out) / max(1, n_train)
+            # propagate arch tag for evaluation pipeline
+            cfg.arch = "csnn"
+
+            train_summary = {
+                "arch": "csnn",
+                "N": int(n_train),
+                "device": str(device),
+                "time": int(cfg.time),
+                "encoder": str(cfg.encoder),
+                "spikes_per_sample": spikes_per_sample,
+                "energy_proxy_per_sample": spikes_per_sample,
+                "winners_unique": None,
+                "winner_HHI": None,
+            }
+        else:
+            train_summary, connection, lif_layer, net, encoder = run_experiment(
+                cfg, verbose=verbose, progress=progress
+            )
+
+        # Save a checkpoint right after training so we can resume eval/readouts later.
+        if arch == "csnn":
+            _status_update(stage="checkpoint_after_train")
+            early_ckpt = run_dir / "model_after_train.pt"
+            save_snn(
+                str(early_ckpt),
+                cfg,
+                connection,
+                lif_layer,
+                train_summary=train_summary,
+                eval_summary=None,
+                notes={"run_id": run_id, "config_hash": cfg_digest, "stage": "after_train"},
+            )
 
         label_map_path = None
         label_map_summary = None
         label_map = None
         if not skip_label_map:
-            label_map = build_label_map(
-                net,
-                None,
-                lif_layer,
-                encoder,
-                n_calib=n_calib,
-                T=cfg.time,
-                top_k=max(1, int(cfg.top_k) if int(cfg.top_k) > 0 else 3),
-                seed=cfg.seed,
-            )
+            _status_update(stage="label_map")
+            if arch == "csnn":
+                from csnn_mnist_net import _spikes_flat_to_hw
+
+                def _enc_hw(x):
+                    return _spikes_flat_to_hw(encoder(x), cfg.torch_device())
+
+                label_map = build_label_map(
+                    net,
+                    None,
+                    lif_layer,
+                    _enc_hw,
+                    n_calib=n_calib,
+                    T=cfg.time,
+                    top_k=max(1, int(getattr(cfg, "top_k", 0)) if int(getattr(cfg, "top_k", 0)) > 0 else 3),
+                    seed=cfg.seed,
+                )
+            else:
+                label_map = build_label_map(
+                    net,
+                    None,
+                    lif_layer,
+                    encoder,
+                    n_calib=n_calib,
+                    T=cfg.time,
+                    top_k=max(1, int(cfg.top_k) if int(cfg.top_k) > 0 else 3),
+                    seed=cfg.seed,
+                )
             label_map_path = run_dir / "label_map.pt"
             save_label_map(
                 str(label_map_path),
@@ -117,6 +244,7 @@ def run_single_experiment(
 
         eval_summary = None
         if not skip_eval:
+            _status_update(stage="eval")
             eval_summary = eval_readouts_from_net(
                 net,
                 lif_layer,

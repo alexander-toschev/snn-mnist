@@ -67,11 +67,21 @@ def build_label_map(net, input_layer, lif_layer, encoder, n_calib: int = 2000, T
         spikes_in = encoder(x)
         if torch.is_tensor(spikes_in):
             spikes_in = spikes_in.to(dev)
+
+        # Final safety: if BindsNet has stale CPU tensors inside layers, it can crash.
+        # Re-apply net.to(dev) here (cheap on CPU, safe on CUDA).
+        if hasattr(net, "to"):
+            net.to(dev)
+
         net.run(inputs={"Input": spikes_in}, time=T)
 
-        s = lif_mon.get("s")         # [T,1,N]
-        s2 = s[:, 0, :]              # [T,N]
-        counts = s2.sum(0)           # [N]
+        s = lif_mon.get("s")
+        # FC: [T,1,N] -> [T,N]; Conv: [T,1,C,H,W] -> [T, C*H*W]
+        if s.dim() == 5:
+            s2 = s[:, 0, :, :, :].reshape(s.shape[0], -1)
+        else:
+            s2 = s[:, 0, :]
+        counts = s2.sum(0)
         if counts.sum() > 0:
             k = min(top_k, lif_layer.n)
             topi = torch.topk(counts, k=k).indices

@@ -66,12 +66,14 @@ def _format_output(spikes_tbn: Tensor, had_batch: bool, out_format: str) -> Tens
         return spikes_tbn
     if out_format == "tbn1":
         return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], 1, spikes_tbn.shape[2])
+    if out_format == "tbnchw":
+        return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], 1, 28, 28)
     if out_format == "auto":
         if had_batch:
             return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], 1, spikes_tbn.shape[2])
         # legacy-friendly single: [T,1,784]
         return spikes_tbn[:, :1, :]
-    raise ValueError('out_format must be one of {"auto","TBN","TBN1"}')
+    raise ValueError('out_format must be one of {"auto","TBN","TBN1","TBNCHW"}')
 
 
 class LatencyEncoder:
