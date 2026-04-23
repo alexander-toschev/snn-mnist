@@ -259,13 +259,15 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
         # E -> I (excitatory): identity over (C,H,W)
         c_ei = Connection(source=conv_lif, target=inhib_lif, w=torch.ones(conv_lif.n, inhib_lif.n))
-        c_ei.w = torch.eye(conv_lif.n, device=device) * float(getattr(cfg, "ei_w_ei", 1.0))
+        w_ei = torch.eye(conv_lif.n, device=device) * float(getattr(cfg, "ei_w_ei", 1.0))
+        c_ei.w.data = w_ei
 
         # I -> E (inhibitory): negative identity
         c_ie = Connection(source=inhib_lif, target=conv_lif, w=torch.ones(inhib_lif.n, conv_lif.n))
         strength = float(getattr(cfg, "ei_strength", 5.0))
         base = float(getattr(cfg, "ei_w_ie", 1.0))
-        c_ie.w = -torch.eye(inhib_lif.n, device=device) * (strength * base)
+        w_ie = -torch.eye(inhib_lif.n, device=device) * (strength * base)
+        c_ie.w.data = w_ie
 
         net.add_connection(c_ei, source="Conv1", target="Inhib1")
         net.add_connection(c_ie, source="Inhib1", target="Conv1")
