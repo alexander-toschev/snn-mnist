@@ -68,11 +68,10 @@ class CSCfg:
     top_k: int = 0  # if >0, apply top-k competition on counts per sample
     wta_enable: bool = False  # if True, apply per-position channel WTA on Conv1 spikes
 
-    # Diehl&Cook-style E/I (approx): add inhibitory layer and E->I / I->E connections
-    ei_enable: bool = False
-    ei_strength: float = 5.0          # overall inhibitory strength (I->E)
-    ei_w_ei: float = 1.0              # E->I weight (fixed)
-    ei_w_ie: float = 1.0              # base I->E weight before scaling by ei_strength
+    # Local competition (approx Diehl&Cook): per-(h,w) soft WTA on Conv1 spikes.
+    # Keeps winner channel unchanged, suppresses others by (1 - local_inhib_strength).
+    local_inhib_enable: bool = False
+    local_inhib_strength: float = 0.7
 
     # misc (keep parity with FC pipeline overrides)
     log_every: int = 50
@@ -190,48 +189,37 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     net.add_layer(input_layer, name="Input")
     net.add_layer(conv_lif, name="Conv1")
 
-    # Optional E/I competition (approx Diehl & Cook): add inhibitory population.
-    inhib_lif = None
-    if bool(getattr(cfg, "ei_enable", False)):
-        inhib_lif = LIFNodes(
-            shape=(cfg.c1_out, h, w),
-            traces=False,
-            thresh=float(cfg.thresh_init),
-            rest=float(cfg.rest_val),
-            reset=float(cfg.reset_val),
-            refrac=int(cfg.refrac_val),
-            tc_decay=float(cfg.tau_val),
-        )
-        net.add_layer(inhib_lif, name="Inhib1")
+    # Optional local inhibition (soft WTA) is applied via a net.run hook below.
 
-    # Optional WTA competition (Diehl & Cook-style simplification).
-    if bool(getattr(cfg, "wta_enable", False)):
+    # Optional local competition hooks.
+    if bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
         import types
 
         _orig_run = net.run
 
-        def _wta_step_(s_t: torch.Tensor) -> torch.Tensor:
+        def _winner_mask(s_t: torch.Tensor) -> torch.Tensor:
             # s_t: [B,C,H,W]
-            if s_t.ndim != 4:
-                return s_t
-            B, C, H, W = s_t.shape
-            # winner channel per position
             win = s_t.argmax(dim=1, keepdim=True)  # [B,1,H,W]
-            mask = torch.zeros((B, C, H, W), device=s_t.device, dtype=torch.bool)
+            mask = torch.zeros_like(s_t, dtype=torch.bool)
             mask.scatter_(1, win, True)
-            return s_t * mask.to(s_t.dtype)
+            return mask
 
-        def _run_with_wta(self, *args, **kwargs):
+        def _run_with_competition(self, *args, **kwargs):
             out = _orig_run(*args, **kwargs)
             try:
                 s = conv_lif.s
-                if torch.is_tensor(s) and s.numel() > 0:
-                    conv_lif.s = _wta_step_(s)
+                if torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0:
+                    m = _winner_mask(s)
+                    if bool(getattr(cfg, "wta_enable", False)):
+                        conv_lif.s = s * m.to(s.dtype)
+                    elif bool(getattr(cfg, "local_inhib_enable", False)):
+                        g = float(getattr(cfg, "local_inhib_strength", 0.7))
+                        conv_lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
             except Exception:
                 pass
             return out
 
-        net.run = types.MethodType(_run_with_wta, net)
+        net.run = types.MethodType(_run_with_competition, net)
 
     conn = Conv2dConnection(
         source=input_layer,
@@ -253,24 +241,6 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
     net.add_connection(conn, source="Input", target="Conv1")
 
-    # Add fixed E->I and I->E connections (1-to-1 at each position) if enabled.
-    if inhib_lif is not None:
-        from bindsnet.network.topology import Connection
-
-        # E -> I (excitatory): identity over (C,H,W)
-        c_ei = Connection(source=conv_lif, target=inhib_lif, w=torch.ones(conv_lif.n, inhib_lif.n))
-        w_ei = torch.eye(conv_lif.n, device=device) * float(getattr(cfg, "ei_w_ei", 1.0))
-        c_ei.w.data = w_ei
-
-        # I -> E (inhibitory): negative identity
-        c_ie = Connection(source=inhib_lif, target=conv_lif, w=torch.ones(inhib_lif.n, conv_lif.n))
-        strength = float(getattr(cfg, "ei_strength", 5.0))
-        base = float(getattr(cfg, "ei_w_ie", 1.0))
-        w_ie = -torch.eye(inhib_lif.n, device=device) * (strength * base)
-        c_ie.w.data = w_ie
-
-        net.add_connection(c_ei, source="Conv1", target="Inhib1")
-        net.add_connection(c_ie, source="Inhib1", target="Conv1")
 
     if hasattr(net, "to"):
         net.to(device)
