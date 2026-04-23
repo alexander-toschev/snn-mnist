@@ -34,6 +34,7 @@ from csnn_mnist_net import (
     build_csnn,
     build_encoder_from_cfg as build_csnn_encoder,
     _spikes_flat_to_hw,
+    load_csnn_weights_into,
 )  # noqa: E402
 from label_map import build_label_map, save_label_map  # noqa: E402
 from evaluation import eval_readouts_from_net  # noqa: E402
@@ -138,7 +139,13 @@ def run_single_experiment(
 
             S_out = 0
             last_report = time.time()
-            _status_update(stage="train", i=0, n=int(n_train), pct=0.0)
+            # Resume: skip training if resume_checkpoint provided.
+            if getattr(cfg, "resume_checkpoint", None):
+                _status_update(stage="resume_checkpoint")
+                load_csnn_weights_into(net, connection, lif_layer, str(cfg.resume_checkpoint))
+                n_train = 0
+            else:
+                _status_update(stage="train", i=0, n=int(n_train), pct=0.0)
 
             for i in range(n_train):
                 x = ds[i]["image"].to(device)
@@ -182,7 +189,7 @@ def run_single_experiment(
             )
 
         # Save a checkpoint right after training so we can resume eval/readouts later.
-        if arch == "csnn":
+        if arch == "csnn" and not getattr(cfg, "resume_checkpoint", None):
             _status_update(stage="checkpoint_after_train")
             early_ckpt = run_dir / "model_after_train.pt"
             save_snn(
@@ -245,6 +252,13 @@ def run_single_experiment(
         eval_summary = None
         if not skip_eval:
             _status_update(stage="eval")
+            def _eval_status_cb(stage: str, **kw):
+                # kw: step, write_pos, batch_size, n_samples
+                i = int(kw.get("write_pos", 0) + kw.get("batch_size", 0))
+                n = int(kw.get("n_samples", 0))
+                pct = 100.0 * i / max(1, n) if n else None
+                _status_update(stage=stage, i=i, n=n, pct=pct)
+
             eval_summary = eval_readouts_from_net(
                 net,
                 lif_layer,
@@ -253,6 +267,7 @@ def run_single_experiment(
                 label_map=label_map,
                 n_train_counts=n_train_counts,
                 n_test_counts=n_test_counts,
+                status_cb=_eval_status_cb,
             )
 
         best_name, best_acc = best_readout(eval_summary)

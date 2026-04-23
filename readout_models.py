@@ -98,6 +98,7 @@ def train_mlp_readout(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     device: Optional[str] = None,
+    status_cb=None,
 ) -> Tuple[nn.Module, float]:
     """
     Simple MLP readout training on prepared features.
@@ -124,12 +125,17 @@ def train_mlp_readout(
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
     model.train()
-    for _ in range(int(epochs)):
+    for ep in range(int(epochs)):
         for xb, yb in loader:
             opt.zero_grad()
             loss = crit(model(xb), yb)
             loss.backward()
             opt.step()
+        if status_cb is not None:
+            try:
+                status_cb(epoch=int(ep + 1), epochs=int(epochs), loss=float(loss.detach().cpu().item()))
+            except Exception:
+                pass
 
     model.eval()
     with torch.no_grad():

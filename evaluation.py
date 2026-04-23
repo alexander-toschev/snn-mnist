@@ -122,7 +122,9 @@ def probe_readouts_counts(
     Xtr: torch.Tensor, ytr: torch.Tensor,
     Xte: torch.Tensor, yte: torch.Tensor,
     n_hidden: int,
-    mlp_hidden: int = 256, mlp_epochs: int = 30
+    mlp_hidden: int = 256, mlp_epochs: int = 30,
+    *,
+    status_cb=None,
 ) -> Dict[str, float]:
     """
     Пробует 3 пайплайна над spike-counts:
@@ -137,33 +139,63 @@ def probe_readouts_counts(
     Xtr_c = torch.log1p(Xtr[:, :N]); Xte_c = torch.log1p(Xte[:, :N])
     mu = Xtr_c.mean(0, keepdim=True); sd = Xtr_c.std(0, keepdim=True).clamp_min(1e-6)
     Xtr_z = (Xtr_c - mu) / sd; Xte_z = (Xte_c - mu) / sd
+    if status_cb is not None:
+        try:
+            status_cb(stage="readout_linear")
+        except Exception:
+            pass
     _, acc_counts_lin = _train_linear_readout(Xtr_z, ytr, Xte_z, yte)
 
-    # 2) PCA-whiten + Linear (can fail on degenerate covariance for small/quiet runs)
+    # 2) PCA-whiten + Linear (optional, very heavy for large N)
     acc_pca_lin = None
-    try:
-        Ztr_w, Zte_w, *_ = _pca_whiten_counts(Xtr[:, :N], Xte[:, :N], var_keep=0.95)
-        _, acc_pca_lin = _train_linear_readout(Ztr_w, ytr, Zte_w, yte)
-    except Exception as e:
-        print(f"[eval] PCAwhiten skipped: {type(e).__name__}: {e}")
+    import os
+    if os.environ.get("SNN_READOUT_PCA", "0") == "1":
+        try:
+            if status_cb is not None:
+                try:
+                    status_cb(stage="readout_pca")
+                except Exception:
+                    pass
+            Ztr_w, Zte_w, *_ = _pca_whiten_counts(Xtr[:, :N], Xte[:, :N], var_keep=0.95)
+            _, acc_pca_lin = _train_linear_readout(Ztr_w, ytr, Zte_w, yte)
+        except Exception as e:
+            print(f"[eval] PCAwhiten skipped: {type(e).__name__}: {e}")
 
-    # 3) TF-IDF + MLP
-    Xtr_n, Xte_n, _, _, _ = tfidf_from_counts(Xtr[:, :N], Xte[:, :N])
-    _, acc_tfidf_mlp = train_mlp_readout(
-        Xtr_n, ytr, Xte_n, yte, hidden=mlp_hidden, dropout=0.2,
-        epochs=mlp_epochs, batch_size=256
-    )
+    # 3) TF-IDF + MLP (optional)
+    acc_tfidf_mlp = None
+    import os
+    if os.environ.get("SNN_READOUT_TFIDF_MLP", "0") == "1":
+        try:
+            Xtr_n, Xte_n, _, _, _ = tfidf_from_counts(Xtr[:, :N], Xte[:, :N])
+
+            def _mlp_status_cb(**kw):
+                if status_cb is not None:
+                    try:
+                        status_cb(stage="readout_mlp", **kw)
+                    except Exception:
+                        pass
+
+            _, acc_tfidf_mlp = train_mlp_readout(
+                Xtr_n, ytr, Xte_n, yte, hidden=mlp_hidden, dropout=0.2,
+                epochs=mlp_epochs, batch_size=256,
+                status_cb=_mlp_status_cb,
+            )
+        except Exception as e:
+            print(f"[eval] TFIDF+MLP skipped: {type(e).__name__}: {e}")
+
     out = {
         "counts_zscore+Linear": acc_counts_lin,
-        "TFIDF+MLP": acc_tfidf_mlp,
     }
+    if acc_tfidf_mlp is not None:
+        out["TFIDF+MLP"] = acc_tfidf_mlp
     if acc_pca_lin is not None:
         out["PCAwhiten+Linear"] = acc_pca_lin
     return out
 
 def eval_readouts_from_net(
     net, lif_layer, encoder, cfg, label_map=None,
-    n_train_counts: int = 60000, n_test_counts: int = 10000
+    n_train_counts: int = 60000, n_test_counts: int = 10000,
+    status_cb=None,
 ) -> Dict[str, float]:
     """
     Собирает counts(+WTA-hist) через counts_readout.collect_counts_plus,
@@ -190,12 +222,22 @@ def eval_readouts_from_net(
 
     dev = cfg.torch_device() if hasattr(cfg, "torch_device") else None
 
+    def _mk_on_batch(stage_name: str):
+        if status_cb is None:
+            return None
+        def _cb(**kw):
+            status_cb(stage=stage_name, **kw)
+        return _cb
+
+    # Use progress=False to avoid tqdm stdout issues (BrokenPipe) in background runs.
     Xtr, ytr = collect_counts_plus_fast(
         net, lif_layer, encoder, ds_train, n_train_counts,
         T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
         encoder_rate_boost=cfg.encoder_rate_boost,
         spikes_transform=spikes_transform,
         device=dev,
+        progress=False,
+        on_batch=_mk_on_batch("collect_train_counts"),
     )
     Xte, yte = collect_counts_plus_fast(
         net, lif_layer, encoder, ds_test, n_test_counts,
@@ -203,8 +245,24 @@ def eval_readouts_from_net(
         encoder_rate_boost=cfg.encoder_rate_boost,
         spikes_transform=spikes_transform,
         device=dev,
+        progress=False,
+        on_batch=_mk_on_batch("collect_test_counts"),
     )
     N = lif_layer.n
-    accs = probe_readouts_counts(Xtr, ytr, Xte, yte, n_hidden=N)
+
+    if status_cb is not None:
+        try:
+            status_cb(stage="readout_probe")
+        except Exception:
+            pass
+
+    accs = probe_readouts_counts(Xtr, ytr, Xte, yte, n_hidden=N, status_cb=status_cb)
+
+    if status_cb is not None:
+        try:
+            status_cb(stage="readout_done")
+        except Exception:
+            pass
+
     return accs
 

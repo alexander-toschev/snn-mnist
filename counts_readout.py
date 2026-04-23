@@ -338,6 +338,7 @@ def collect_counts_plus_fast(
     label_map,
     *,
     spikes_transform=None,
+    on_batch=None,
     vt_eval_offset: float = 0.0,
     debug_every: int = 1000,
     verify_offset: bool = True,
@@ -512,6 +513,11 @@ def collect_counts_plus_fast(
 
     for step, (x_b, y_b) in enumerate(iterator):
         B = x_b.shape[0]
+        if on_batch is not None:
+            try:
+                on_batch(step=step, write_pos=write_pos, batch_size=B, n_samples=n_samples)
+            except Exception:
+                pass
 
         # A) ингибицию глушим на окно (если нужно)
         if rec_conn is not None:
@@ -653,10 +659,12 @@ def collect_counts_plus_fast(
 
         if progress and debug_every and (write_pos % debug_every == 0):
             sum_out = float(counts_bn.sum().detach().cpu())
-            iterator.set_postfix_str(
-                f"sum_out={sum_out:.2f} vt({'abs' if threshold_abs is not None else 'off' if vt_eval_offset==0 else 'off='+str(vt_eval_offset)}) "
-                f"boost={encoder_rate_boost:g} inh={'off' if temp_disable_inh else 'on'}"
-            )
+            # iterator is tqdm only when progress bar is enabled.
+            if hasattr(iterator, "set_postfix_str"):
+                iterator.set_postfix_str(
+                    f"sum_out={sum_out:.2f} vt({'abs' if threshold_abs is not None else 'off' if vt_eval_offset==0 else 'off='+str(vt_eval_offset)}) "
+                    f"boost={encoder_rate_boost:g} inh={'off' if temp_disable_inh else 'on'}"
+                )
 
     # 5) снять монитор
     net.monitors.pop("lif_tmp_counts_plus_fast", None)

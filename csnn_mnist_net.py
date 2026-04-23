@@ -35,6 +35,7 @@ class CSCfg:
     device: str = "cpu"
     seed: int = 42
     N: int = 12000
+    resume_checkpoint: str | None = None
 
     # input encoding
     encoder: str = "poisson"
@@ -130,6 +131,24 @@ def _spikes_flat_to_hw(spikes: Tensor, device: torch.device) -> Tensor:
         raise ValueError(f"Unexpected spikes ndim={spikes.ndim}")
 
     return spikes_tbn.view(T, B, 1, 28, 28)
+
+
+def load_csnn_weights_into(net: Network, conn: Connection, lif_layer: LIFNodes, ckpt_path: str) -> None:
+    """Load weights (and optional thresholds) from a save_snn() checkpoint.
+
+    Expects keys: W, v_thresh (optional), cfg.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if "W" not in ckpt:
+        raise ValueError(f"Checkpoint missing 'W': {ckpt_path}")
+
+    with torch.no_grad():
+        conn.w.copy_(ckpt["W"].to(conn.w.device))
+        # Threshold tensor name depends on BindsNet version.
+        vt = getattr(lif_layer, "v_thresh", getattr(lif_layer, "thresh", None))
+        if vt is not None and "v_thresh" in ckpt and torch.is_tensor(vt):
+            vt.copy_(ckpt["v_thresh"].to(vt.device))
+    print(f"[csnn] Loaded checkpoint: {ckpt_path}")
 
 
 def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:

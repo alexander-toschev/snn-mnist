@@ -44,6 +44,17 @@
   - Error: BrokenPipeError from tqdm (stdout pipe) during counts collection in eval
   - Fixed in tag `Csnn-eval-45` (tqdm safe + progress redirected to files)
 
+### CSNN GPU resume-eval (from checkpoint)
+
+- **Run** `20260423T154120Z_cd384ffafdd6` (status: ok)
+  - Device: CUDA (GPU)
+  - Resume checkpoint: `runs_csnn/20260423T042039Z_13f871056c01/model_after_train.pt`
+  - Conv1: `c1_out=64`, `kernel=5`, output 64×24×24 (= 36,864 LIF)
+  - Encoder: poisson, `TBNCHW`, deterministic, `rate_scale=0.011`, `rate_boost=3.0`
+  - `T=100`, train_counts=2000, test_counts=500
+  - Best readout: **counts_zscore+Linear**
+  - Accuracy: **0.48**
+
 ## Current configuration notes
 
 - CSNN Conv1 neuron count (LIF): `c1_out * (28 - k + 1 + 2*pad)^2`.
