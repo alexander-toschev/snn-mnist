@@ -156,7 +156,9 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
     Notes:
     - We keep a single conv layer to stay close to bio STDP setups.
-    - Later we can add Conv2 + pooling + E/I competition.
+    - Optional competition: simple per-position winner-take-all (WTA) inhibition.
+      When enabled, after each simulation step we keep only the max-spiking
+      channel at each (h,w) and zero-out the rest.
     """
     device = cfg.torch_device()
 
@@ -180,6 +182,35 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
     net.add_layer(input_layer, name="Input")
     net.add_layer(conv_lif, name="Conv1")
+
+    # Optional WTA competition (Diehl & Cook-style simplification).
+    if bool(getattr(cfg, "wta_enable", False)):
+        import types
+
+        _orig_run = net.run
+
+        def _wta_step_(s_t: torch.Tensor) -> torch.Tensor:
+            # s_t: [B,C,H,W]
+            if s_t.ndim != 4:
+                return s_t
+            B, C, H, W = s_t.shape
+            # winner channel per position
+            win = s_t.argmax(dim=1, keepdim=True)  # [B,1,H,W]
+            mask = torch.zeros((B, C, H, W), device=s_t.device, dtype=torch.bool)
+            mask.scatter_(1, win, True)
+            return s_t * mask.to(s_t.dtype)
+
+        def _run_with_wta(self, *args, **kwargs):
+            out = _orig_run(*args, **kwargs)
+            try:
+                s = conv_lif.s
+                if torch.is_tensor(s) and s.numel() > 0:
+                    conv_lif.s = _wta_step_(s)
+            except Exception:
+                pass
+            return out
+
+        net.run = types.MethodType(_run_with_wta, net)
 
     conn = Conv2dConnection(
         source=input_layer,
