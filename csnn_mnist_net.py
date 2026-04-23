@@ -66,6 +66,7 @@ class CSCfg:
     # inhibition/competition
     inhib_strength: float = 0.7
     top_k: int = 0  # if >0, apply top-k competition on counts per sample
+    wta_enable: bool = False  # if True, apply per-position channel WTA on Conv1 spikes
 
     # misc (keep parity with FC pipeline overrides)
     log_every: int = 50
