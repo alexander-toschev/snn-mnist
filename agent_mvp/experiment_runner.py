@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict
 import time
 
+import torch
+
 # project imports
 ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = Path(__file__).resolve().parent
