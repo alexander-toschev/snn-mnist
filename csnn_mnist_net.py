@@ -292,6 +292,18 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
         wmin=0.0,
         wmax=1.0,
     )
+
+    # Initialize conv weights to a reasonable scale and optionally normalize per out-channel.
+    try:
+        # Start with uniform weights in [0, 0.3] (empirically avoids silent networks).
+        conn.w.data.uniform_(0.0, 0.3)
+        if bool(getattr(cfg, "w_norm_enable", False)):
+            tgt = float(getattr(cfg, "w_norm_target", 78.4))
+            eps = 1e-8
+            sabs = conn.w.data.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+            conn.w.data.mul_(tgt / sabs)
+    except Exception:
+        pass
     # Attach STDP (PostPre) like in the FC setup.
     conn.update_rule = PostPre(
         connection=conn,
