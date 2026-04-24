@@ -210,6 +210,8 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
         if bool(getattr(cfg, "adapt_thresh_enable", False)):
             conv_lif.theta = None
             conv_lif.thresh_base = torch.as_tensor(float(cfg.thresh_init), device=device)
+            # keep base threshold in the layer
+            conv_lif.thresh = conv_lif.thresh_base
 
         def _winner_mask(s_t: torch.Tensor) -> torch.Tensor:
             win = s_t.argmax(dim=1, keepdim=True)  # [B,1,H,W]
@@ -233,8 +235,9 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                         # increase on spike
                         theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach()
                         conv_lif.theta = theta
-                        # apply threshold (per-batch)
-                        conv_lif.thresh = conv_lif.thresh_base + theta
+                        # NOTE: Do not assign conv_lif.thresh as a batch-shaped tensor.
+                        # We'll apply adaptive threshold by shifting v (equivalent to raising threshold).
+                        conv_lif.v = conv_lif.v - theta
 
                     # local competition
                     if bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
