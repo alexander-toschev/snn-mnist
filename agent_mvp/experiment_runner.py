@@ -74,6 +74,7 @@ def run_single_experiment(
     n_calib: int = 2000,
     n_train_counts: int = 60000,
     n_test_counts: int = 10000,
+    activity_log_every: int = 1000,
     skip_label_map: bool = False,
     skip_eval: bool = False,
     verbose: bool = True,
@@ -147,6 +148,8 @@ def run_single_experiment(
             else:
                 _status_update(stage="train", i=0, n=int(n_train), pct=0.0)
 
+            activity_log_path = run_dir / "activity.jsonl"
+
             for i in range(n_train):
                 x = ds[i]["image"].to(device)
                 spikes = encoder(x)
@@ -156,8 +159,30 @@ def run_single_experiment(
                 else:
                     spikes_hw = spikes
                 net.run(inputs={"Input": spikes_hw}, time=T)
+
                 sH = mon_H.get("s")
-                S_out += int(sH.sum().item())
+                ssum = int(sH.sum().item())
+                S_out += ssum
+
+                if activity_log_every and ((i + 1) % int(activity_log_every) == 0):
+                    try:
+                        theta_mean = None
+                        theta = getattr(lif_layer, "theta", None)
+                        if theta is not None and hasattr(theta, "mean"):
+                            theta_mean = float(theta.mean().item())
+                        rec = {
+                            "i": int(i + 1),
+                            "spikes": int(ssum),
+                            "spikes_per_sample": float(ssum),
+                            "theta_mean": theta_mean,
+                            "t": utc_now_iso(),
+                        }
+                        with open(activity_log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        _status_update(stage="train", activity_spikes=float(ssum), activity_theta_mean=theta_mean)
+                    except Exception:
+                        pass
+
                 net.reset_state_variables()
 
                 now = time.time()
@@ -331,6 +356,7 @@ def main() -> None:
     parser.add_argument("--n-calib", type=int, default=2000)
     parser.add_argument("--n-train-counts", type=int, default=60000)
     parser.add_argument("--n-test-counts", type=int, default=10000)
+    parser.add_argument("--activity-log-every", type=int, default=1000)
     parser.add_argument("--skip-label-map", action="store_true")
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -349,6 +375,7 @@ def main() -> None:
         n_calib=args.n_calib,
         n_train_counts=args.n_train_counts,
         n_test_counts=args.n_test_counts,
+        activity_log_every=args.activity_log_every,
         skip_label_map=args.skip_label_map,
         skip_eval=args.skip_eval,
         verbose=not args.quiet,
