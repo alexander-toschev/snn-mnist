@@ -305,12 +305,13 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     except Exception:
         pass
     # Attach STDP (PostPre) like in the FC setup.
+    # IMPORTANT: In BindsNET PostPre, nu is (pre_rate, post_rate) and is expected non-negative.
+    # The rule itself applies negative sign to the pre-synaptic term and positive to post.
+    nu_pre = float(getattr(cfg, "nu_minus", 1e-3))
+    nu_post = float(getattr(cfg, "nu_plus", 1e-4))
     conn.update_rule = PostPre(
         connection=conn,
-        nu=(
-            torch.tensor(float(getattr(cfg, "nu_plus", 1e-4))),
-            torch.tensor(float(getattr(cfg, "nu_minus", -1e-3))),
-        ),
+        nu=(torch.tensor(nu_pre), torch.tensor(nu_post)),
     )
 
     net.add_connection(conn, source="Input", target="Conv1")
