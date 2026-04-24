@@ -68,8 +68,14 @@ class CSCfg:
     top_k: int = 0  # if >0, apply top-k competition on counts per sample
     wta_enable: bool = False  # if True, apply per-position channel WTA on Conv1 spikes
 
-    # Local competition (approx Diehl&Cook): per-(h,w) soft WTA on Conv1 spikes.
-    # Keeps winner channel unchanged, suppresses others by (1 - local_inhib_strength).
+    # Diehl & Cook-style competition (conv-friendly approximation): E/I with local inhibition per (h,w)
+    # Implemented without NxN weights: after each step we subtract an inhibitory current from
+    # non-winner channels at each (h,w), proportional to the winner activity.
+    diehl_enable: bool = False
+    diehl_exc: float = 22.5   # like exc in DiehlAndCook2015 (scales winner drive)
+    diehl_inh: float = 120.0  # like inh in DiehlAndCook2015 (strength of inhibition onto others)
+
+    # Legacy local competition hook (kept for ablations)
     local_inhib_enable: bool = False
     local_inhib_strength: float = 0.7
 
@@ -200,6 +206,7 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     if (
         bool(getattr(cfg, "wta_enable", False))
         or bool(getattr(cfg, "local_inhib_enable", False))
+        or bool(getattr(cfg, "diehl_enable", False))
         or bool(getattr(cfg, "adapt_thresh_enable", False))
     ):
         import types
@@ -239,8 +246,17 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                         # We'll apply adaptive threshold by shifting v (equivalent to raising threshold).
                         conv_lif.v = conv_lif.v - theta
 
-                    # local competition
-                    if bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
+                    # competition
+                    if bool(getattr(cfg, "diehl_enable", False)):
+                        # Approximate Diehl&Cook E/I: keep winner, inhibit others proportionally to winner.
+                        m = _winner_mask(s)
+                        win_act = (s * m.to(s.dtype))  # [B,C,H,W] one-hot at winner channel
+                        inh = float(getattr(cfg, "diehl_inh", 120.0))
+                        # subtract from membrane potential of non-winners
+                        conv_lif.v = conv_lif.v - inh * win_act.sum(dim=1, keepdim=True) * (~m).to(s.dtype)
+                        # recompute spikes after inhibition
+                        conv_lif.s = conv_lif.v >= conv_lif.thresh
+                    elif bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
                         m = _winner_mask(s)
                         if bool(getattr(cfg, "wta_enable", False)):
                             conv_lif.s = s * m.to(s.dtype)
