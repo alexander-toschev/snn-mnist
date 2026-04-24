@@ -208,7 +208,7 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
         # theta state for adaptive threshold
         if bool(getattr(cfg, "adapt_thresh_enable", False)):
-            conv_lif.theta = torch.zeros((1, cfg.c1_out, h, w), device=device)
+            conv_lif.theta = None
             conv_lif.thresh_base = torch.as_tensor(float(cfg.thresh_init), device=device)
 
         def _winner_mask(s_t: torch.Tensor) -> torch.Tensor:
@@ -225,13 +225,15 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                     # adaptive threshold update
                     if bool(getattr(cfg, "adapt_thresh_enable", False)):
                         theta = conv_lif.theta
+                        if theta is None or (torch.is_tensor(theta) and theta.shape != s.shape):
+                            theta = torch.zeros_like(s)
                         # decay
                         tau = float(getattr(cfg, "tau_theta", 1e4))
                         theta = theta * (1.0 - 1.0 / max(1.0, tau))
                         # increase on spike
                         theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach()
                         conv_lif.theta = theta
-                        # apply threshold
+                        # apply threshold (per-batch)
                         conv_lif.thresh = conv_lif.thresh_base + theta
 
                     # local competition
