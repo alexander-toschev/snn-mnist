@@ -24,7 +24,7 @@ from torch import Tensor
 from bindsnet.network import Network
 from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.network.topology import Conv2dConnection, Connection
-from bindsnet.learning import PostPre
+from bindsnet.learning import PostPre, WeightDependentPostPre
 
 from encoders import LatencyEncoder, PoissonEncoder
 
@@ -309,7 +309,7 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     # The rule itself applies negative sign to the pre-synaptic term and positive to post.
     nu_pre = float(getattr(cfg, "nu_minus", 1e-3))
     nu_post = float(getattr(cfg, "nu_plus", 1e-4))
-    conn.update_rule = PostPre(
+    conn.update_rule = WeightDependentPostPre(
         connection=conn,
         nu=(torch.tensor(nu_pre), torch.tensor(nu_post)),
         weight_decay=1.0,
