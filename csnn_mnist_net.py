@@ -312,6 +312,7 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     conn.update_rule = PostPre(
         connection=conn,
         nu=(torch.tensor(nu_pre), torch.tensor(nu_post)),
+        weight_decay=1.0,
     )
 
     net.add_connection(conn, source="Input", target="Conv1")
