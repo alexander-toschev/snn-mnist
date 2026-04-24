@@ -52,6 +52,10 @@ class CSCfg:
     c1_stride: int = 1
     c1_pad: int = 0
 
+    # weight normalization (Diehl&Cook uses norm=78.4 for FC). For conv we normalize per out-channel.
+    w_norm_enable: bool = False
+    w_norm_target: float = 78.4
+
     # neuron params (shared)
     tau_val: float = 150.0
     refrac_val: float = 2.0
@@ -229,6 +233,16 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
         def _run_with_hooks(self, *args, **kwargs):
             out = _orig_run(*args, **kwargs)
             try:
+                # Optional weight norm (after STDP update inside net.run).
+                if bool(getattr(cfg, "w_norm_enable", False)):
+                    # Conv2dConnection weights: [out_ch, in_ch, kH, kW]
+                    w = connection.w
+                    if torch.is_tensor(w) and w.ndim == 4:
+                        tgt = float(getattr(cfg, "w_norm_target", 78.4))
+                        eps = 1e-8
+                        sabs = w.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+                        connection.w.data = w * (tgt / sabs)
+
                 s = conv_lif.s
                 if torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0:
                     # adaptive threshold update
