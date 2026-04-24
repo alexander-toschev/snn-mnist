@@ -73,6 +73,11 @@ class CSCfg:
     local_inhib_enable: bool = False
     local_inhib_strength: float = 0.7
 
+    # Adaptive threshold (Diehl & Cook): v_thresh = thresh_base + theta
+    adapt_thresh_enable: bool = False
+    theta_plus: float = 0.05
+    tau_theta: float = 1e4
+
     # misc (keep parity with FC pipeline overrides)
     log_every: int = 50
     warmup_N: int = 0
@@ -191,35 +196,57 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
     # Optional local inhibition (soft WTA) is applied via a net.run hook below.
 
-    # Optional local competition hooks.
-    if bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
+    # Optional local competition + adaptive threshold hooks.
+    if (
+        bool(getattr(cfg, "wta_enable", False))
+        or bool(getattr(cfg, "local_inhib_enable", False))
+        or bool(getattr(cfg, "adapt_thresh_enable", False))
+    ):
         import types
 
         _orig_run = net.run
 
+        # theta state for adaptive threshold
+        if bool(getattr(cfg, "adapt_thresh_enable", False)):
+            conv_lif.theta = torch.zeros((1, cfg.c1_out, h, w), device=device)
+            conv_lif.thresh_base = torch.as_tensor(float(cfg.thresh_init), device=device)
+
         def _winner_mask(s_t: torch.Tensor) -> torch.Tensor:
-            # s_t: [B,C,H,W]
             win = s_t.argmax(dim=1, keepdim=True)  # [B,1,H,W]
             mask = torch.zeros_like(s_t, dtype=torch.bool)
             mask.scatter_(1, win, True)
             return mask
 
-        def _run_with_competition(self, *args, **kwargs):
+        def _run_with_hooks(self, *args, **kwargs):
             out = _orig_run(*args, **kwargs)
             try:
                 s = conv_lif.s
                 if torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0:
-                    m = _winner_mask(s)
-                    if bool(getattr(cfg, "wta_enable", False)):
-                        conv_lif.s = s * m.to(s.dtype)
-                    elif bool(getattr(cfg, "local_inhib_enable", False)):
-                        g = float(getattr(cfg, "local_inhib_strength", 0.7))
-                        conv_lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
+                    # adaptive threshold update
+                    if bool(getattr(cfg, "adapt_thresh_enable", False)):
+                        theta = conv_lif.theta
+                        # decay
+                        tau = float(getattr(cfg, "tau_theta", 1e4))
+                        theta = theta * (1.0 - 1.0 / max(1.0, tau))
+                        # increase on spike
+                        theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach()
+                        conv_lif.theta = theta
+                        # apply threshold
+                        conv_lif.thresh = conv_lif.thresh_base + theta
+
+                    # local competition
+                    if bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
+                        m = _winner_mask(s)
+                        if bool(getattr(cfg, "wta_enable", False)):
+                            conv_lif.s = s * m.to(s.dtype)
+                        elif bool(getattr(cfg, "local_inhib_enable", False)):
+                            g = float(getattr(cfg, "local_inhib_strength", 0.7))
+                            conv_lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
             except Exception:
                 pass
             return out
 
-        net.run = types.MethodType(_run_with_competition, net)
+        net.run = types.MethodType(_run_with_hooks, net)
 
     conn = Conv2dConnection(
         source=input_layer,
