@@ -160,8 +160,13 @@ def run_single_experiment(
                     spikes_hw = spikes
                 net.run(inputs={"Input": spikes_hw}, time=T)
 
-                sH = mon_H.get("s")
-                ssum = int(sH.sum().item())
+                # Use layer state directly for per-sample spike count (monitor buffers can be confusing to reset).
+                s_layer = getattr(lif_layer, "s", None)
+                if torch.is_tensor(s_layer):
+                    ssum = int(s_layer.sum().item())
+                else:
+                    sH = mon_H.get("s")
+                    ssum = int(sH.sum().item())
                 S_out += ssum
 
                 if activity_log_every and ((i + 1) % int(activity_log_every) == 0):
