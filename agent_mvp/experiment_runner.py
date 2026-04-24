@@ -166,6 +166,14 @@ def run_single_experiment(
 
                 if activity_log_every and ((i + 1) % int(activity_log_every) == 0):
                     try:
+                        in_spikes = None
+                        if torch.is_tensor(spikes_hw):
+                            in_spikes = int(spikes_hw.sum().item())
+                        wsum = float(connection.w.detach().abs().sum().item()) if hasattr(connection, "w") else None
+                        rec_extra = {"in_spikes": in_spikes, "w_abs_sum": wsum}
+                    except Exception:
+                        rec_extra = {}
+                    try:
                         theta_mean = None
                         theta = getattr(lif_layer, "theta", None)
                         if theta is not None and hasattr(theta, "mean"):
@@ -176,6 +184,7 @@ def run_single_experiment(
                             "spikes_per_sample": float(ssum),
                             "theta_mean": theta_mean,
                             "t": utc_now_iso(),
+                            **rec_extra,
                         }
                         with open(activity_log_path, "a", encoding="utf-8") as f:
                             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
