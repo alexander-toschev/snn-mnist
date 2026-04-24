@@ -176,8 +176,14 @@ def run_single_experiment(
                         in_spikes = None
                         if torch.is_tensor(spikes_hw):
                             in_spikes = int(spikes_hw.sum().item())
-                        wsum = float(connection.w.detach().abs().sum().item()) if hasattr(connection, "w") else None
-                        rec_extra = {"in_spikes": in_spikes, "w_abs_sum": wsum}
+                        wsum = None
+                        wmin = None
+                        wmax = None
+                        if hasattr(connection, "w") and torch.is_tensor(connection.w):
+                            wsum = float(connection.w.detach().abs().sum().item())
+                            wmin = float(connection.w.detach().min().item())
+                            wmax = float(connection.w.detach().max().item())
+                        rec_extra = {"in_spikes": in_spikes, "w_abs_sum": wsum, "w_min": wmin, "w_max": wmax}
                     except Exception:
                         rec_extra = {}
                     try:
