@@ -72,12 +72,11 @@ class CSCfg:
     top_k: int = 0  # if >0, apply top-k competition on counts per sample
     wta_enable: bool = False  # if True, apply per-position channel WTA on Conv1 spikes
 
-    # Diehl & Cook-style competition (conv-friendly approximation): E/I with local inhibition per (h,w)
-    # Implemented without NxN weights: after each step we subtract an inhibitory current from
-    # non-winner channels at each (h,w), proportional to the winner activity.
-    diehl_enable: bool = False
-    diehl_exc: float = 22.5   # like exc in DiehlAndCook2015 (scales winner drive)
-    diehl_inh: float = 120.0  # like inh in DiehlAndCook2015 (strength of inhibition onto others)
+    # Diehl & Cook-style E/I competition (conv-friendly): add explicit inhibitory population.
+    # We implement local (per-(h,w)) E->I and I->E without NxN weights.
+    ei_enable: bool = False
+    ei_exc: float = 22.5
+    ei_inh: float = 120.0
 
     # Legacy local competition hook (kept for ablations)
     local_inhib_enable: bool = False
@@ -201,8 +200,23 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
         tc_decay=float(cfg.tau_val),
     )
 
+    # Inhibitory population (Ai) like Diehl&Cook, same shape.
+    inhib_lif = None
+    if bool(getattr(cfg, "ei_enable", False)):
+        inhib_lif = LIFNodes(
+            shape=(cfg.c1_out, h, w),
+            traces=True,
+            thresh=float(cfg.thresh_init),
+            rest=float(cfg.rest_val),
+            reset=float(cfg.reset_val),
+            refrac=int(cfg.refrac_val),
+            tc_decay=float(cfg.tau_val),
+        )
+
     net.add_layer(input_layer, name="Input")
     net.add_layer(conv_lif, name="Conv1")
+    if inhib_lif is not None:
+        net.add_layer(inhib_lif, name="Inhib1")
 
     # Optional local inhibition (soft WTA) is applied via a net.run hook below.
 
@@ -210,7 +224,7 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     if (
         bool(getattr(cfg, "wta_enable", False))
         or bool(getattr(cfg, "local_inhib_enable", False))
-        or bool(getattr(cfg, "diehl_enable", False))
+        or bool(getattr(cfg, "ei_enable", False))
         or bool(getattr(cfg, "adapt_thresh_enable", False))
     ):
         import types
@@ -261,14 +275,17 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                         conv_lif.v = conv_lif.v - theta
 
                     # competition
-                    if bool(getattr(cfg, "diehl_enable", False)):
-                        # Approximate Diehl&Cook E/I: keep winner, inhibit others proportionally to winner.
-                        m = _winner_mask(s)
-                        win_act = (s * m.to(s.dtype))  # [B,C,H,W] one-hot at winner channel
-                        inh = float(getattr(cfg, "diehl_inh", 120.0))
-                        # subtract from membrane potential of non-winners
-                        conv_lif.v = conv_lif.v - inh * win_act.sum(dim=1, keepdim=True) * (~m).to(s.dtype)
-                        # recompute spikes after inhibition
+                    if bool(getattr(cfg, "ei_enable", False)) and inhib_lif is not None:
+                        # Run inhibitory population on current excitatory spikes.
+                        exc = float(getattr(cfg, "ei_exc", 22.5))
+                        inh = float(getattr(cfg, "ei_inh", 120.0))
+
+                        # Feed E spikes into I as current.
+                        inhib_lif.forward(exc * s.detach())
+
+                        # Inhibit E membrane where I spiked.
+                        i_s = inhib_lif.s.detach().to(s.dtype)
+                        conv_lif.v = conv_lif.v - inh * i_s
                         conv_lif.s = conv_lif.v >= conv_lif.thresh
                     elif bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
                         m = _winner_mask(s)
