@@ -176,6 +176,26 @@ def run_single_experiment(
                         in_spikes = None
                         if torch.is_tensor(spikes_hw):
                             in_spikes = int(spikes_hw.sum().item())
+
+                        # independent spike count check via monitor
+                        ssum_mon = None
+                        try:
+                            sH = mon_H.get("s")
+                            if torch.is_tensor(sH):
+                                ssum_mon = int(sH.sum().item())
+                        except Exception:
+                            pass
+
+                        v_mean = None
+                        v_max = None
+                        try:
+                            v = getattr(lif_layer, "v", None)
+                            if torch.is_tensor(v) and v.numel() > 0:
+                                v_mean = float(v.mean().item())
+                                v_max = float(v.max().item())
+                        except Exception:
+                            pass
+
                         wsum = None
                         wmin = None
                         wmax = None
@@ -183,7 +203,16 @@ def run_single_experiment(
                             wsum = float(connection.w.detach().abs().sum().item())
                             wmin = float(connection.w.detach().min().item())
                             wmax = float(connection.w.detach().max().item())
-                        rec_extra = {"in_spikes": in_spikes, "w_abs_sum": wsum, "w_min": wmin, "w_max": wmax}
+
+                        rec_extra = {
+                            "in_spikes": in_spikes,
+                            "w_abs_sum": wsum,
+                            "w_min": wmin,
+                            "w_max": wmax,
+                            "v_mean": v_mean,
+                            "v_max": v_max,
+                            "spikes_mon": ssum_mon,
+                        }
                     except Exception:
                         rec_extra = {}
                     try:
