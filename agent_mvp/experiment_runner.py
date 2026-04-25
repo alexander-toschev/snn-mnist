@@ -162,13 +162,20 @@ def run_single_experiment(
                     spikes_hw = spikes
                 net.run(inputs={"Input": spikes_hw}, time=T)
 
-                # Use layer state directly for per-sample spike count (monitor buffers can be confusing to reset).
-                s_layer = getattr(lif_layer, "s", None)
-                if torch.is_tensor(s_layer):
-                    ssum = int(s_layer.sum().item())
-                else:
-                    sH = mon_H.get("s")
-                    ssum = int(sH.sum().item())
+                # Per-sample spike count: sum over time from monitor, then reset monitor buffers.
+                ssum = None
+                try:
+                    sH = mon_H.get("s")  # expected [T,B,C,H,W]
+                    if torch.is_tensor(sH):
+                        ssum = int(sH.sum().item())
+                        mon_H.reset_state_variables()
+                except Exception:
+                    ssum = None
+
+                if ssum is None:
+                    # Fallback: last-step spikes only.
+                    s_layer = getattr(lif_layer, "s", None)
+                    ssum = int(s_layer.sum().item()) if torch.is_tensor(s_layer) else 0
                 S_out += ssum
 
                 if activity_log_every and ((i + 1) % int(activity_log_every) == 0):
@@ -177,14 +184,8 @@ def run_single_experiment(
                         if torch.is_tensor(spikes_hw):
                             in_spikes = int(spikes_hw.sum().item())
 
-                        # independent spike count check via monitor
+                        # monitor cross-check (same as ssum); keep None to avoid confusion
                         ssum_mon = None
-                        try:
-                            sH = mon_H.get("s")
-                            if torch.is_tensor(sH):
-                                ssum_mon = int(sH.sum().item())
-                        except Exception:
-                            pass
 
                         v_mean = None
                         v_max = None
