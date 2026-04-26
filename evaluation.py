@@ -75,22 +75,63 @@ def _train_linear_readout(
     Xtr: torch.Tensor, ytr: torch.Tensor,
     Xte: torch.Tensor, yte: torch.Tensor,
     epochs: int = 25, batch_size: int = 512,
-    lr: float = 1e-3, weight_decay: float = 1e-4
+    lr: float = 1e-3, weight_decay: float = 1e-4,
+    device: str | torch.device = "cpu",
 ) -> Tuple[nn.Module, float]:
-    """Простая линейная голова (softmax). Возвращает (model, acc_test)."""
-    in_dim = Xtr.shape[1]
-    head = nn.Linear(in_dim, 10)
-    opt = torch.optim.Adam(head.parameters(), lr=lr, weight_decay=weight_decay)
+    """Простая линейная голова (softmax). Возвращает (model, acc_test).
+
+    Важно: чтобы не ловить OOM на больших матрицах признаков, тренируем стримингово
+    через DataLoader, без создания гигантских промежуточных копий.
+    """
+    dev = torch.device(device)
+    in_dim = int(Xtr.shape[1])
+    head = nn.Linear(in_dim, 10).to(dev)
+    opt = torch.optim.SGD(head.parameters(), lr=lr, weight_decay=weight_decay)
     crit = nn.CrossEntropyLoss()
-    loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size, shuffle=True)
+
+    # DataLoader читает батчи из уже созданных тензоров Xtr/ytr на CPU.
+    # pin_memory ускоряет H2D при dev=cuda.
+    loader = DataLoader(
+        TensorDataset(Xtr, ytr),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(dev.type == "cuda"),
+        drop_last=False,
+    )
+
     head.train()
-    for _ in range(epochs):
+    for _ in range(int(epochs)):
         for xb, yb in loader:
-            opt.zero_grad(); loss = crit(head(xb), yb); loss.backward(); opt.step()
+            xb = xb.to(dev, non_blocking=True)
+            yb = yb.to(dev, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            loss = crit(head(xb), yb)
+            loss.backward()
+            opt.step()
+
     head.eval()
     with torch.no_grad():
-        acc = (head(Xte).argmax(1) == yte).float().mean().item()
-    return head, acc
+        # Evaluate in chunks to keep memory bounded.
+        correct = 0
+        total = 0
+        te_loader = DataLoader(
+            TensorDataset(Xte, yte),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(dev.type == "cuda"),
+            drop_last=False,
+        )
+        for xb, yb in te_loader:
+            xb = xb.to(dev, non_blocking=True)
+            yb = yb.to(dev, non_blocking=True)
+            pred = head(xb).argmax(1)
+            correct += int((pred == yb).sum().item())
+            total += int(yb.numel())
+        acc = (correct / max(1, total))
+
+    return head, float(acc)
 
 def _pca_whiten_counts(
     Xtr_counts: torch.Tensor, Xte_counts: torch.Tensor, var_keep: float = 0.95
@@ -144,7 +185,7 @@ def probe_readouts_counts(
             status_cb(stage="readout_linear")
         except Exception:
             pass
-    _, acc_counts_lin = _train_linear_readout(Xtr_z, ytr, Xte_z, yte)
+    _, acc_counts_lin = _train_linear_readout(Xtr_z, ytr, Xte_z, yte, device=(Xtr_z.device if hasattr(Xtr_z,'device') else "cpu"))
 
     # 2) PCA-whiten + Linear (optional, very heavy for large N)
     acc_pca_lin = None
@@ -230,6 +271,17 @@ def eval_readouts_from_net(
         return _cb
 
     # Use progress=False to avoid tqdm stdout issues (BrokenPipe) in background runs.
+    # Stream large X matrices to disk-backed memmaps when requested.
+    import os
+    use_mm = os.environ.get("SNN_COUNTS_MEMMAP", "0") in ("1", "true", "True", "yes", "YES")
+    if use_mm:
+        from pathlib import Path
+        mm_dir = Path(os.environ.get("SNN_COUNTS_MEMMAP_DIR", "."))
+        mm_dir.mkdir(parents=True, exist_ok=True)
+        # Attach flags to net for counts_readout.collect_counts_plus_fast.
+        net._use_memmap = True
+        net._memmap_path = str(mm_dir / "Xtr.memmap")
+
     Xtr, ytr = collect_counts_plus_fast(
         net, lif_layer, encoder, ds_train, n_train_counts,
         T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
@@ -239,6 +291,9 @@ def eval_readouts_from_net(
         progress=False,
         on_batch=_mk_on_batch("collect_train_counts"),
     )
+    if use_mm:
+        net._memmap_path = str(mm_dir / "Xte.memmap")
+
     Xte, yte = collect_counts_plus_fast(
         net, lif_layer, encoder, ds_test, n_test_counts,
         T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
@@ -249,6 +304,47 @@ def eval_readouts_from_net(
         on_batch=_mk_on_batch("collect_test_counts"),
     )
     N = lif_layer.n
+
+    # NOTE: probe_readouts_counts can be heavy / unstable in some environments.
+    # Allow disabling it via env var for robust end-to-end runs.
+    # When disabled, we still train the stable Linear readout.
+    import os
+    if os.environ.get("SNN_DISABLE_READOUT_PROBE", "0") not in ("0", "false", "False", "no", "NO"):
+        if status_cb is not None:
+            try:
+                status_cb(stage="readout_probe_skipped")
+            except Exception:
+                pass
+        # Reuse the same stable pipeline as probe_readouts_counts: log1p(counts) + zscore + Linear.
+        # Support disk-backed memmaps (NumPy) to avoid OOM.
+        N = int(lif_layer.n)
+        import numpy as np
+        if not torch.is_tensor(Xtr):
+            Xtr = torch.from_numpy(np.asarray(Xtr))
+        if not torch.is_tensor(Xte):
+            Xte = torch.from_numpy(np.asarray(Xte))
+        if not torch.is_tensor(ytr):
+            ytr = torch.from_numpy(np.asarray(ytr)).long()
+        if not torch.is_tensor(yte):
+            yte = torch.from_numpy(np.asarray(yte)).long()
+        Xtr_c = torch.log1p(Xtr[:, :N]); Xte_c = torch.log1p(Xte[:, :N])
+        mu = Xtr_c.mean(0, keepdim=True)
+        sd = Xtr_c.std(0, keepdim=True).clamp_min(1e-6)
+        Xtr_z = (Xtr_c - mu) / sd
+        Xte_z = (Xte_c - mu) / sd
+
+        if status_cb is not None:
+            try:
+                status_cb(stage="readout_linear")
+            except Exception:
+                pass
+        _, acc_counts_lin = _train_linear_readout(Xtr_z, ytr, Xte_z, yte, device=(dev or "cpu"))
+        if status_cb is not None:
+            try:
+                status_cb(stage="readout_done")
+            except Exception:
+                pass
+        return {"counts_zscore+Linear": float(acc_counts_lin)}
 
     if status_cb is not None:
         try:

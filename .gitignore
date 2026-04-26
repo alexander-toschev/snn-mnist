@@ -1,5 +1,16 @@
 /.ipynb_checkpoints
 /__pycache__
 /runs_agent/_queue
+/runs_agent/
+/runs_csnn/
+/openclaw/
+/.openclaw/
+/skills/
+AGENTS.md
+SOUL.md
+USER.md
+TOOLS.md
+IDENTITY.md
+HEARTBEAT.md
 /data
 *.pyc

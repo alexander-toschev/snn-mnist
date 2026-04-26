@@ -405,6 +405,13 @@ def main() -> None:
     parser.add_argument("--outdir", default="runs_agent", help="Root directory for run folders and registry.jsonl")
     parser.add_argument("--config-json", help="Path to JSON file with Cfg overrides")
     parser.add_argument("--set", action="append", default=[], help="Cfg override, e.g. --set time=300")
+    parser.add_argument(
+        "--resume-from",
+        help=(
+            "Path to an existing run directory to resume from. "
+            "Loads <run_dir>/model_after_train.pt and skips training (N is forced to 0)."
+        ),
+    )
     parser.add_argument("--n-calib", type=int, default=2000)
     parser.add_argument("--n-train-counts", type=int, default=60000)
     parser.add_argument("--n-test-counts", type=int, default=10000)
@@ -418,6 +425,18 @@ def main() -> None:
     file_overrides = read_json(args.config_json) if args.config_json else {}
     cli_overrides = parse_overrides(args.set)
     overrides = merge_dicts(file_overrides, cli_overrides)
+
+    if args.resume_from:
+        resume_dir = Path(args.resume_from)
+        ckpt = resume_dir / "model_after_train.pt"
+        if not ckpt.exists():
+            raise SystemExit(f"--resume-from: missing checkpoint: {ckpt}")
+        # Do not force N=0: label_map/eval use cfg.N for dataset sizing.
+        # Training will be skipped inside run_single_experiment when resume_checkpoint is provided.
+        overrides = merge_dicts(overrides, {
+            "resume_checkpoint": str(ckpt),
+        })
+
     if not overrides:
         raise SystemExit("No config overrides provided. Pass --config-json or --set key=value.")
 

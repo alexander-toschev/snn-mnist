@@ -416,8 +416,26 @@ def collect_counts_plus_fast(
     net.add_monitor(mon, name="lif_tmp_counts_plus_fast")
 
     N = lif_layer.n
-    X = torch.empty((n_samples, N + 10), device=output_device, dtype=torch.float32)
-    y = torch.empty((n_samples,), device=output_device, dtype=torch.long)
+    # For large conv hidden layers, X can be huge (n_samples*(N+10)).
+    # Allow streaming to a disk-backed memmap to avoid OOM.
+    use_memmap = False
+    mm_path = None
+    try:
+        use_memmap = bool(getattr(net, "_use_memmap", False))
+    except Exception:
+        use_memmap = False
+
+    if use_memmap:
+        import numpy as np
+        mm_path = getattr(net, "_memmap_path", None)
+        if mm_path is None:
+            raise ValueError("use_memmap requested but net._memmap_path is None")
+        X = np.memmap(str(mm_path), mode="w+", dtype=np.float32, shape=(n_samples, N + 10))
+        y_path = str(mm_path) + ".y.memmap"
+        y = np.memmap(y_path, mode="w+", dtype=np.int64, shape=(n_samples,))
+    else:
+        X = torch.empty((n_samples, N + 10), device=output_device, dtype=torch.float32)
+        y = torch.empty((n_samples,), device=output_device, dtype=torch.long)
 
     # label_map и пороги
     lm = torch.as_tensor(label_map, dtype=torch.long, device=device)
@@ -629,12 +647,17 @@ def collect_counts_plus_fast(
         feats = torch.cat([counts_bn, hist_b10], dim=1)               # [B, N+10]
 
         # F) запись
-        if output_device.type == "cpu":
-            X[write_pos:write_pos + B] = feats.detach().cpu()
-            y[write_pos:write_pos + B] = y_b.detach().cpu()
+        if use_memmap:
+            # Write directly to disk-backed arrays.
+            X[write_pos:write_pos + B, :] = feats.detach().cpu().numpy()
+            y[write_pos:write_pos + B] = y_b.detach().cpu().numpy()
         else:
-            X[write_pos:write_pos + B] = feats.to(output_device)
-            y[write_pos:write_pos + B] = y_b.to(output_device)
+            if output_device.type == "cpu":
+                X[write_pos:write_pos + B] = feats.detach().cpu()
+                y[write_pos:write_pos + B] = y_b.detach().cpu()
+            else:
+                X[write_pos:write_pos + B] = feats.to(output_device)
+                y[write_pos:write_pos + B] = y_b.to(output_device)
 
         write_pos += B
 
