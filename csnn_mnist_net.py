@@ -255,7 +255,10 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                         tgt = float(getattr(cfg, "w_norm_target", 78.4))
                         eps = 1e-8
                         sabs = w.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
-                        connection.w.data = w * (tgt / sabs)
+                        # Conv-safe normalization: only scale DOWN.
+                        # Scaling UP can instantly saturate weights at wmax (often 1.0) and cause "zalipe".
+                        scale = (tgt / sabs).clamp_max(1.0)
+                        connection.w.data = w * scale
 
                 s = conv_lif.s
                 if torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0:
@@ -318,7 +321,8 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
             tgt = float(getattr(cfg, "w_norm_target", 78.4))
             eps = 1e-8
             sabs = conn.w.data.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
-            conn.w.data.mul_(tgt / sabs)
+            # Same conv-safe normalization at init: only scale DOWN.
+            conn.w.data.mul_((tgt / sabs).clamp_max(1.0))
     except Exception:
         pass
     # Attach STDP (PostPre) like in the FC setup.

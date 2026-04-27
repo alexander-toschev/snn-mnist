@@ -16,7 +16,251 @@ from torch.utils.data import DataLoader, TensorDataset
 from counts_readout import collect_counts_plus_fast, make_mnist_datasets
 from readout_models import tfidf_from_counts, train_mlp_readout
 
-__all__ = ["probe_readouts_counts"]
+__all__ = ["probe_readouts_counts", "diehl_vote_accuracy"]
+
+
+@torch.no_grad()
+def diehl_vote_accuracy_batched(
+    net,
+    lif_layer,
+    encoder,
+    label_map,
+    *,
+    T: int,
+    ds_test,
+    n_test: int = 2000,
+    batch_size: int = 32,
+    device: torch.device | str | None = None,
+    status_cb=None,
+):
+    """Batched Diehl&Cook-style voting accuracy using label_map assignments.
+
+    Much faster than per-sample voting for large conv layers.
+    We vote using per-sample spike counts over time (equivalent to voting over
+    per-timestep winners, but cheaper):
+
+      pred = argmax_c sum_{n: label_map[n]=c} counts[n]
+
+    Returns dict with accuracy and diagnostics.
+    """
+    import torch
+    from bindsnet.network.monitors import Monitor
+
+    if device is None:
+        device = lif_layer.s.device if torch.is_tensor(getattr(lif_layer, "s", None)) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    # Freeze STDP
+    for c in net.connections.values():
+        if hasattr(c, "update_rule"):
+            c.update_rule.nu = (torch.as_tensor(0.0, device=device), torch.as_tensor(0.0, device=device))
+
+    if hasattr(net, "to"):
+        net.to(device)
+    if hasattr(lif_layer, "to"):
+        lif_layer.to(device)
+
+    lm = torch.as_tensor(label_map, dtype=torch.long, device=device)
+    valid = (lm >= 0)
+
+    # Precompute class masks [10, N] as float for matmul.
+    N = int(lif_layer.n)
+    cls_mask = torch.zeros((10, N), device=device, dtype=torch.float32)
+    if valid.any():
+        idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        cls = lm[idx].clamp(min=0, max=9)
+        cls_mask[cls, idx] = 1.0
+
+    mon = Monitor(lif_layer, state_vars=("s",), time=T)
+    net.add_monitor(mon, name="lif_tmp_vote_b")
+
+    correct = 0
+    total = 0
+    no_vote = 0
+
+    def _collate(batch):
+        xb = torch.stack([b["image"] for b in batch], dim=0)
+        yb = torch.tensor([int(b["label"]) for b in batch], dtype=torch.long)
+        return xb, yb
+
+    from torch.utils.data import DataLoader
+    dl = DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=(device.type == "cuda"), collate_fn=_collate)
+
+    seen = 0
+    for step, (x_b, y_b) in enumerate(dl):
+        if seen >= n_test:
+            break
+        B = x_b.shape[0]
+        if seen + B > n_test:
+            x_b = x_b[: n_test - seen]
+            y_b = y_b[: n_test - seen]
+            B = x_b.shape[0]
+
+        if status_cb is not None and (seen % 256 == 0):
+            try:
+                status_cb(stage="diehl_vote_batched", i=seen, n=n_test, pct=100.0 * seen / max(1, n_test))
+            except Exception:
+                pass
+
+        x_b = x_b.to(device, non_blocking=True)
+        y_b = y_b.to(device, non_blocking=True)
+
+        spikes_in = encoder(x_b)
+        if torch.is_tensor(spikes_in) and spikes_in.device != device:
+            spikes_in = spikes_in.to(device, non_blocking=True)
+
+        net.run(inputs={"Input": spikes_in}, time=T)
+
+        s = mon.get("s")  # [T,B,C,H,W] or [T,B,N]
+        if s.dim() == 5:
+            Tt, Bb, Cc, Hh, Ww = s.shape
+            s = s.view(Tt, Bb, Cc * Hh * Ww)
+        if s.dim() == 4 and s.shape[2] == 1:
+            s = s[:, :, 0, :]
+        s = s.to(device=device, dtype=torch.float32)
+
+        # counts: [B, N]
+        counts = s.sum(0)
+
+        if not valid.any():
+            pred = torch.full((B,), -1, device=device, dtype=torch.long)
+            no_vote += int(B)
+        else:
+            # class_scores: [B,10] = counts @ cls_mask.T
+            scores = counts @ cls_mask.t()
+            # If a sample has zero activity on valid neurons, mark as no-vote.
+            active = (counts[:, valid].sum(dim=1) > 0)
+            pred = scores.argmax(dim=1)
+            pred = torch.where(active, pred, torch.full_like(pred, -1))
+            no_vote += int((pred < 0).sum().item())
+
+        mask = (pred >= 0)
+        if mask.any():
+            total += int(mask.sum().item())
+            correct += int((pred[mask] == y_b[mask]).sum().item())
+
+        net.reset_state_variables()
+        mon.reset_state_variables()
+        seen += B
+
+    net.monitors.pop("lif_tmp_vote_b", None)
+
+    acc = correct / max(1, total)
+    return {
+        "accuracy": float(acc),
+        "eval_n": int(n_test),
+        "voted_n": int(total),
+        "no_vote_n": int(no_vote),
+        "batch_size": int(batch_size),
+    }
+
+
+@torch.no_grad()
+def diehl_vote_accuracy(
+    net,
+    lif_layer,
+    encoder,
+    label_map,
+    *,
+    T: int,
+    ds_test,
+    n_test: int = 2000,
+    device: torch.device | str | None = None,
+    status_cb=None,
+):
+    """Diehl&Cook-style voting accuracy using label_map assignments.
+
+    For each sample, run the network for T steps, then pick per-timestep winners
+    (argmax over hidden spikes) and majority-vote their assigned labels.
+
+    Returns dict with accuracy and some diagnostics.
+    """
+    import torch
+    from bindsnet.network.monitors import Monitor
+
+    if device is None:
+        device = lif_layer.s.device if torch.is_tensor(getattr(lif_layer, "s", None)) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    # Freeze STDP
+    for c in net.connections.values():
+        if hasattr(c, "update_rule"):
+            c.update_rule.nu = (torch.as_tensor(0.0, device=device), torch.as_tensor(0.0, device=device))
+
+    if hasattr(net, "to"):
+        net.to(device)
+    if hasattr(lif_layer, "to"):
+        lif_layer.to(device)
+
+    lm = torch.as_tensor(label_map, dtype=torch.long, device=device)
+    valid = (lm >= 0)
+
+    mon = Monitor(lif_layer, state_vars=("s",), time=T)
+    net.add_monitor(mon, name="lif_tmp_vote")
+
+    correct = 0
+    total = 0
+    no_vote = 0
+
+    for i in range(int(n_test)):
+        if status_cb is not None and (i % 100 == 0):
+            try:
+                status_cb(stage="diehl_vote", i=i, n=n_test, pct=100.0 * i / max(1, n_test))
+            except Exception:
+                pass
+
+        sample = ds_test[i]
+        x = sample["image"].to(device)
+        y = int(sample["label"])
+
+        spikes_in = encoder(x)
+        if torch.is_tensor(spikes_in) and spikes_in.device != device:
+            spikes_in = spikes_in.to(device, non_blocking=True)
+
+        net.run(inputs={"Input": spikes_in}, time=T)
+
+        s = mon.get("s")  # [T,1,N] or [T,B,C,H,W]
+        if s.dim() == 5:
+            Tt, Bb, Cc, Hh, Ww = s.shape
+            s = s.view(Tt, Bb, Cc * Hh * Ww)
+        if s.dim() == 3:
+            s = s[:, 0, :]
+        s = s.to(device=device, dtype=torch.float32)
+
+        if not valid.any():
+            pred = -1
+        else:
+            # mask invalid neurons
+            s_mask = s.clone()
+            s_mask[:, ~valid] = -1e9
+            active_t = (s[:, valid].sum(dim=1) > 0)
+            if active_t.any():
+                winners = s_mask[active_t].argmax(dim=1)
+                cls = lm[winners]
+                votes = torch.bincount(cls, minlength=10)
+                pred = int(votes.argmax().item())
+            else:
+                pred = -1
+
+        if pred < 0:
+            no_vote += 1
+        else:
+            total += 1
+            if pred == y:
+                correct += 1
+
+        net.reset_state_variables()
+        mon.reset_state_variables()
+
+    net.monitors.pop("lif_tmp_vote", None)
+
+    acc = correct / max(1, total)
+    return {
+        "accuracy": float(acc),
+        "eval_n": int(n_test),
+        "voted_n": int(total),
+        "no_vote_n": int(no_vote),
+    }
 
 @torch.no_grad()
 def evaluate_on_mnist(net, input_layer, lif_layer, encoder, label_map, T: int = 200, top_k: int = 3, n_test: int = 1000, seed: int = 999):
@@ -305,6 +549,64 @@ def eval_readouts_from_net(
     )
     N = lif_layer.n
 
+    # Optional: Diehl&Cook-style proportional voting (no label_map needed).
+    # Uses supervised labels to compute per-neuron class proportions and votes by counts.
+    import os
+    if os.environ.get("SNN_PROPORTIONAL_VOTE", "0") in ("1", "true", "True", "yes", "YES"):
+        if status_cb is not None:
+            try:
+                status_cb(stage="propvote_train")
+            except Exception:
+                pass
+        # Ensure tensors
+        import numpy as np
+        if not torch.is_tensor(Xtr):
+            Xtr_t = torch.from_numpy(np.asarray(Xtr))
+        else:
+            Xtr_t = Xtr
+        if not torch.is_tensor(ytr):
+            ytr_t = torch.from_numpy(np.asarray(ytr)).long()
+        else:
+            ytr_t = ytr.long()
+        if not torch.is_tensor(Xte):
+            Xte_t = torch.from_numpy(np.asarray(Xte))
+        else:
+            Xte_t = Xte
+        if not torch.is_tensor(yte):
+            yte_t = torch.from_numpy(np.asarray(yte)).long()
+        else:
+            yte_t = yte.long()
+
+        # counts only
+        Xtr_c = Xtr_t[:, :N].to(torch.float32)
+        Xte_c = Xte_t[:, :N].to(torch.float32)
+        ytr_t = ytr_t.to(torch.long)
+        yte_t = yte_t.to(torch.long)
+
+        # C[n,c] = sum spikes for neuron n on class c
+        C = torch.zeros((N, 10), dtype=torch.float32)
+        for c in range(10):
+            m = (ytr_t == c)
+            if m.any():
+                C[:, c] = Xtr_c[m].sum(0)
+        P = C / (C.sum(1, keepdim=True) + 1e-6)  # [N,10]
+
+        if status_cb is not None:
+            try:
+                status_cb(stage="propvote_test")
+            except Exception:
+                pass
+        scores = Xte_c @ P  # [n_test,10]
+        pred = scores.argmax(1)
+        acc = (pred == yte_t).to(torch.float32).mean().item()
+
+        if status_cb is not None:
+            try:
+                status_cb(stage="readout_done")
+            except Exception:
+                pass
+        return {"proportional_vote": float(acc)}
+
     # NOTE: probe_readouts_counts can be heavy / unstable in some environments.
     # Allow disabling it via env var for robust end-to-end runs.
     # When disabled, we still train the stable Linear readout.
@@ -361,4 +663,3 @@ def eval_readouts_from_net(
             pass
 
     return accs
-

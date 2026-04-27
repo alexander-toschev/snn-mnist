@@ -235,6 +235,52 @@ def run_single_experiment(
                     except Exception:
                         pass
 
+                # --- Optional online voting check (proportional vote on a small calibration set) ---
+                # Enabled via env var to avoid slowing down default runs.
+                # Uses counts_readout.collect_counts_plus_fast and the proportional vote implementation in evaluation.
+                try:
+                    import os
+                    vote_every = int(os.environ.get("SNN_VOTE_EVERY", "0") or "0")
+                    vote_calib = int(os.environ.get("SNN_VOTE_CALIB", "0") or "0")
+                except Exception:
+                    vote_every, vote_calib = 0, 0
+
+                if vote_every > 0 and vote_calib > 0 and ((i + 1) % vote_every == 0):
+                    try:
+                        from counts_readout import make_mnist_datasets, collect_counts_plus_fast
+                        from evaluation import eval_readouts_from_net
+
+                        _status_update(stage="vote_check", i=int(i + 1), n=int(n_train), pct=float(100.0 * (i + 1) / max(1, n_train)))
+                        ds_train_chk, ds_test_chk = make_mnist_datasets()
+
+                        # We compute proportional vote accuracy by reusing eval_readouts_from_net with env flag.
+                        os.environ["SNN_PROPORTIONAL_VOTE"] = "1"
+                        os.environ["SNN_DISABLE_READOUT_PROBE"] = "1"
+
+                        accs = eval_readouts_from_net(
+                            net, lif_layer, encoder, cfg,
+                            label_map=[-1] * int(lif_layer.n),
+                            n_train_counts=vote_calib,
+                            n_test_counts=min(vote_calib, 2000),
+                            status_cb=_status_update,
+                        )
+                        vote_acc = None
+                        if isinstance(accs, dict):
+                            vote_acc = accs.get("proportional_vote")
+                        _status_update(stage="vote_check_done", vote_acc=vote_acc)
+                    except Exception as e:
+                        _status_update(stage="vote_check_failed", error=str(e), error_type=type(e).__name__)
+
+                # --- Zalipe detection: detect obviously broken dynamics and fail fast ---
+                if (i + 1) % max(1, int(activity_log_every or 1000)) == 0:
+                    try:
+                        # If weights look constant and voltages are all zero, abort early.
+                        if (wmin is not None and wmax is not None and abs(wmax - wmin) < 1e-8) and (v_max is not None and abs(v_max) < 1e-8):
+                            raise RuntimeError(f"zalipe detected: w_min==w_max=={wmin} and v_max==0 at i={i+1}")
+                    except Exception as e:
+                        _status_update(stage="train_failed", error=str(e), error_type=type(e).__name__)
+                        raise
+
                 net.reset_state_variables()
 
                 now = time.time()
