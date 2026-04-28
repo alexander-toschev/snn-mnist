@@ -591,12 +591,54 @@ def eval_readouts_from_net(
                 C[:, c] = Xtr_c[m].sum(0)
         P = C / (C.sum(1, keepdim=True) + 1e-6)  # [N,10]
 
+        # Optional: penalize "promiscuous" neurons (high overall firing on train).
+        # Motivation: neurons that spike for everything tend to dominate proportional vote.
+        #
+        # Implementation: weight each neuron's vote contribution by
+        #   w_n = 1 / (A_n + eps)^alpha
+        # where A_n is total train spikes for neuron n (sum over classes).
+        #
+        # Controls:
+        #   SNN_PROPVOTE_PENALTY_ALPHA (float, default 0)
+        #     0   -> off (baseline)
+        #     0.5 -> mild penalty
+        #     1.0 -> strong penalty
+        alpha = 0.0
+        try:
+            alpha = float(os.environ.get("SNN_PROPVOTE_PENALTY_ALPHA", "0") or "0")
+        except Exception:
+            alpha = 0.0
+
+        P_eff = P
+        if alpha and alpha > 0:
+            A = C.sum(1)  # [N]
+            w = (A + 1e-6).pow(-alpha)
+            # Keep scale stable across runs.
+            w = w / (w.mean() + 1e-12)
+            P_eff = P * w[:, None]
+
+        # Optional: top-k voting per sample (keep only the k most active neurons by counts).
+        # Control: SNN_PROPVOTE_TOPK (int, default 0 => off)
+        topk = 0
+        try:
+            topk = int(os.environ.get("SNN_PROPVOTE_TOPK", "0") or "0")
+        except Exception:
+            topk = 0
+
         if status_cb is not None:
             try:
                 status_cb(stage="propvote_test")
             except Exception:
                 pass
-        scores = Xte_c @ P  # [n_test,10]
+        if topk and topk > 0 and topk < N:
+            idx = torch.topk(Xte_c, k=topk, dim=1, largest=True, sorted=False).indices  # [n_test,topk]
+            mask = torch.zeros_like(Xte_c)
+            mask.scatter_(1, idx, 1.0)
+            Xte_eff = Xte_c * mask
+        else:
+            Xte_eff = Xte_c
+
+        scores = Xte_eff @ P_eff  # [n_test,10]
         pred = scores.argmax(1)
         acc = (pred == yte_t).to(torch.float32).mean().item()
 

@@ -167,7 +167,24 @@ def load_csnn_weights_into(net: Network, conn: Connection, lif_layer: LIFNodes, 
         # Threshold tensor name depends on BindsNet version.
         vt = getattr(lif_layer, "v_thresh", getattr(lif_layer, "thresh", None))
         if vt is not None and "v_thresh" in ckpt and torch.is_tensor(vt):
-            vt.copy_(ckpt["v_thresh"].to(vt.device))
+            ckpt_vt = ckpt["v_thresh"]
+            if torch.is_tensor(ckpt_vt):
+                ckpt_vt = ckpt_vt.to(vt.device)
+                # Some BindsNet versions store threshold as a scalar tensor ([]) even for shaped layers.
+                # In that case, loading a per-neuron threshold tensor would crash.
+                if tuple(vt.shape) == tuple(ckpt_vt.shape):
+                    vt.copy_(ckpt_vt)
+                elif vt.numel() == 1:
+                    vt.fill_(float(ckpt_vt.float().mean().item()))
+                    print(
+                        f"[csnn] WARN: vt shape {tuple(vt.shape)} != ckpt_vt {tuple(ckpt_vt.shape)}; "
+                        "loaded mean(v_thresh) into scalar threshold"
+                    )
+                elif vt.numel() == ckpt_vt.numel():
+                    vt.copy_(ckpt_vt.reshape_as(vt))
+                    print(f"[csnn] WARN: reshaped ckpt v_thresh {tuple(ckpt_vt.shape)} -> {tuple(vt.shape)}")
+                else:
+                    print(f"[csnn] WARN: skip v_thresh load: vt shape {tuple(vt.shape)} vs ckpt {tuple(ckpt_vt.shape)}")
     print(f"[csnn] Loaded checkpoint: {ckpt_path}")
 
 
@@ -232,10 +249,15 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
         _orig_run = net.run
 
         # theta state for adaptive threshold
+        #
+        # IMPORTANT: This must survive net.reset_state_variables() (called after each sample/batch).
+        # BindsNet resets v/s/traces, but won't touch our custom attribute `theta`.
+        #
+        # We implement adaptive threshold by changing conv_lif.thresh (scalar or [C,H,W]).
+        # Do NOT make it batch-shaped.
         if bool(getattr(cfg, "adapt_thresh_enable", False)):
-            conv_lif.theta = None
+            conv_lif.theta = None  # lazily initialized on first run
             conv_lif.thresh_base = torch.as_tensor(float(cfg.thresh_init), device=device)
-            # keep base threshold in the layer
             conv_lif.thresh = conv_lif.thresh_base
 
         def _winner_mask(s_t: torch.Tensor) -> torch.Tensor:
@@ -244,61 +266,106 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
             mask.scatter_(1, win, True)
             return mask
 
-        def _run_with_hooks(self, *args, **kwargs):
-            out = _orig_run(*args, **kwargs)
+        def _after_step_hooks():
+            """Apply competition/homeostasis after a single simulation step.
+
+            NOTE: These act *after* BindsNet updates for the current step.
+            Running the network step-by-step ensures the effect influences subsequent timesteps
+            (and therefore shapes STDP over time), which is closer to Diehl&Cook dynamics.
+            """
             try:
-                # Optional weight norm (after STDP update inside net.run).
+                # Optional weight norm (after STDP update inside the step).
                 if bool(getattr(cfg, "w_norm_enable", False)):
-                    # Conv2dConnection weights: [out_ch, in_ch, kH, kW]
-                    w = connection.w
+                    w = conn.w  # [out_ch, in_ch, kH, kW]
                     if torch.is_tensor(w) and w.ndim == 4:
                         tgt = float(getattr(cfg, "w_norm_target", 78.4))
                         eps = 1e-8
                         sabs = w.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
-                        # Conv-safe normalization: only scale DOWN.
-                        # Scaling UP can instantly saturate weights at wmax (often 1.0) and cause "zalipe".
                         scale = (tgt / sabs).clamp_max(1.0)
-                        connection.w.data = w * scale
+                        conn.w.data = w * scale
 
                 s = conv_lif.s
-                if torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0:
-                    # adaptive threshold update
-                    if bool(getattr(cfg, "adapt_thresh_enable", False)):
-                        theta = conv_lif.theta
-                        if theta is None or (torch.is_tensor(theta) and theta.shape != s.shape):
-                            theta = torch.zeros_like(s)
-                        # decay
+                if not (torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0):
+                    return
+
+                # adaptive threshold update (per-timestep)
+                if bool(getattr(cfg, "adapt_thresh_enable", False)):
+                    frozen_stdp = False
+                    try:
+                        ur = getattr(conn, "update_rule", None)
+                        nu = getattr(ur, "nu", None)
+                        if nu is not None and isinstance(nu, (tuple, list)) and len(nu) == 2:
+                            n0 = float(torch.as_tensor(nu[0]).abs().sum().item())
+                            n1 = float(torch.as_tensor(nu[1]).abs().sum().item())
+                            frozen_stdp = (n0 + n1) <= 0.0
+                    except Exception:
+                        frozen_stdp = False
+
+                    theta = conv_lif.theta
+                    if (theta is None) or (not torch.is_tensor(theta)) or (theta.ndim != 3):
+                        # [C,H,W]
+                        theta = torch.zeros_like(s[0])
+
+                    if not frozen_stdp:
                         tau = float(getattr(cfg, "tau_theta", 1e4))
                         theta = theta * (1.0 - 1.0 / max(1.0, tau))
-                        # increase on spike
-                        theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach()
+                        # s is [B,C,H,W]; update theta using batch-sum spikes at this timestep
+                        theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach().sum(dim=0)
+                        theta = theta.clamp_(min=0.0, max=10.0)
                         conv_lif.theta = theta
-                        # NOTE: Do not assign conv_lif.thresh as a batch-shaped tensor.
-                        # We'll apply adaptive threshold by shifting v (equivalent to raising threshold).
-                        conv_lif.v = conv_lif.v - theta
 
-                    # competition
-                    if bool(getattr(cfg, "ei_enable", False)) and inhib_lif is not None:
-                        # Run inhibitory population on current excitatory spikes.
-                        exc = float(getattr(cfg, "ei_exc", 22.5))
-                        inh = float(getattr(cfg, "ei_inh", 120.0))
+                    conv_lif.thresh = conv_lif.thresh_base + theta
 
-                        # Feed E spikes into I as current.
-                        inhib_lif.forward(exc * s.detach())
-
-                        # Inhibit E membrane where I spiked.
-                        i_s = inhib_lif.s.detach().to(s.dtype)
-                        conv_lif.v = conv_lif.v - inh * i_s
-                        conv_lif.s = conv_lif.v >= conv_lif.thresh
-                    elif bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
-                        m = _winner_mask(s)
-                        if bool(getattr(cfg, "wta_enable", False)):
-                            conv_lif.s = s * m.to(s.dtype)
-                        elif bool(getattr(cfg, "local_inhib_enable", False)):
-                            g = float(getattr(cfg, "local_inhib_strength", 0.7))
-                            conv_lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
+                # competition
+                if bool(getattr(cfg, "ei_enable", False)) and inhib_lif is not None:
+                    exc = float(getattr(cfg, "ei_exc", 22.5))
+                    inh = float(getattr(cfg, "ei_inh", 120.0))
+                    inhib_lif.forward(exc * s.detach())
+                    i_s = inhib_lif.s.detach().to(s.dtype)
+                    conv_lif.v = conv_lif.v - inh * i_s
+                    conv_lif.s = conv_lif.v >= conv_lif.thresh
+                elif bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
+                    m = _winner_mask(s)
+                    if bool(getattr(cfg, "wta_enable", False)):
+                        conv_lif.s = s * m.to(s.dtype)
+                    elif bool(getattr(cfg, "local_inhib_enable", False)):
+                        g = float(getattr(cfg, "local_inhib_strength", 0.7))
+                        conv_lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
             except Exception:
                 pass
+
+        def _run_with_hooks(self, *args, **kwargs):
+            # Parse signature: net.run(inputs=..., time=...)
+            inputs = kwargs.get("inputs", None)
+            time = kwargs.get("time", None)
+            if inputs is None and len(args) >= 1:
+                inputs = args[0]
+            if time is None and len(args) >= 2:
+                time = args[1]
+            time = int(time) if time is not None else 0
+
+            # Run step-by-step when inputs are time-major, so hooks affect subsequent timesteps.
+            if (
+                time > 1
+                and isinstance(inputs, dict)
+                and "Input" in inputs
+                and torch.is_tensor(inputs["Input"])
+                and inputs["Input"].ndim >= 1
+                and int(inputs["Input"].shape[0]) == time
+            ):
+                rest = {k: v for k, v in kwargs.items() if k not in ("inputs", "time")}
+                out = None
+                x = inputs["Input"]
+                for t in range(time):
+                    step_inputs = dict(inputs)
+                    step_inputs["Input"] = x[t : t + 1]
+                    out = _orig_run(inputs=step_inputs, time=1, **rest)
+                    _after_step_hooks()
+                return out
+
+            # Fallback: single call
+            out = _orig_run(*args, **kwargs)
+            _after_step_hooks()
             return out
 
         net.run = types.MethodType(_run_with_hooks, net)

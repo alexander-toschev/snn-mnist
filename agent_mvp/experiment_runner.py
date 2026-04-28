@@ -248,7 +248,6 @@ def run_single_experiment(
                 if vote_every > 0 and vote_calib > 0 and ((i + 1) % vote_every == 0):
                     try:
                         from counts_readout import make_mnist_datasets, collect_counts_plus_fast
-                        from evaluation import eval_readouts_from_net
 
                         _status_update(stage="vote_check", i=int(i + 1), n=int(n_train), pct=float(100.0 * (i + 1) / max(1, n_train)))
                         ds_train_chk, ds_test_chk = make_mnist_datasets()
@@ -257,6 +256,8 @@ def run_single_experiment(
                         os.environ["SNN_PROPORTIONAL_VOTE"] = "1"
                         os.environ["SNN_DISABLE_READOUT_PROBE"] = "1"
 
+                        # NOTE: do not import eval_readouts_from_net inside this function.
+                        # Python would treat it as a local variable and break later calls.
                         accs = eval_readouts_from_net(
                             net, lif_layer, encoder, cfg,
                             label_map=[-1] * int(lif_layer.n),
