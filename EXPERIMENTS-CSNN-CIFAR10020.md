@@ -224,3 +224,6 @@
   - best_acc=**0.173** (counts_zscore+Linear)
   - spikes/sample=**58709.68**
   - assigned=**164/8192**
+
+## ЕДИНЫЙ ЖУРНАЛ
+Дополнительная сводка/хронология по всем датасетам ведётся в: `EXPERIMENTS-HISTORY.md`.
