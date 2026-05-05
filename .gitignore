@@ -14,3 +14,4 @@ IDENTITY.md
 HEARTBEAT.md
 /data
 *.pyc
+/.clawhub

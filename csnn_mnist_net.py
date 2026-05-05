@@ -34,23 +34,61 @@ class CSCfg:
     time: int = 200
     device: str = "cpu"
     seed: int = 42
+    shuffle: bool = True
     N: int = 12000
+    dataset: str = "mnist"  # mnist | fashion | kmnist | emnist[:split] | cifar100[:K]
     resume_checkpoint: str | None = None
+
+    # input shape (for non-MNIST datasets)
+    input_channels: int = 1
+    input_h: int = 28
+    input_w: int = 28
 
     # input encoding
     encoder: str = "poisson"
     poisson_rate_scale: float = 0.011
     poisson_base_seed: int = 123
     poisson_deterministic: bool = False
-    encoder_out_format: str = "auto"
+    encoder_out_format: str = "TBNCHW"
     encoder_rate_boost: float = 3.0
     latency_x_min: float = 0.05
+
+    # Online homeostasis (keep spikes/sample within a corridor by adjusting Poisson rate scale)
+    homeo_enable: bool = False
+    homeo_spikes_lo: float = 3000.0
+    homeo_spikes_hi: float = 5000.0
+    homeo_spikes_target: float = 4000.0
+    homeo_ema_alpha: float = 0.01
+    homeo_update_every: int = 25
+    homeo_warmup: int = 200
+    homeo_gain: float = 0.25
+    homeo_rate_mul_min: float = 0.3
+    homeo_rate_mul_max: float = 3.0
 
     # conv params
     c1_out: int = 32
     c1_kernel: int = 5
     c1_stride: int = 1
     c1_pad: int = 0
+
+    # Optional 2nd conv layer (Stage-2: deeper STDP-CNN)
+    c2_out: int = 0
+    c2_kernel: int = 3
+    c2_stride: int = 2
+    c2_pad: int = 1
+
+    # Optional 3rd conv layer (Stage-3)
+    # Enabled only when c2_out>0 and c3_out>0.
+    c3_out: int = 0
+    c3_kernel: int = 3
+    c3_stride: int = 2
+    c3_pad: int = 1
+
+    # Greedy layer-wise STDP (when c2_out>0): train Conv1 first, then Conv2.
+    greedy_enable: bool = False
+    greedy_n1: int = 2500
+    # When Conv3 is enabled, train Conv2 for greedy_n2 samples next, then Conv3 for the rest.
+    greedy_n2: int = 2500
 
     # weight normalization (Diehl&Cook uses norm=78.4 for FC). For conv we normalize per out-channel.
     w_norm_enable: bool = False
@@ -77,6 +115,9 @@ class CSCfg:
     ei_enable: bool = False
     ei_exc: float = 22.5
     ei_inh: float = 120.0
+    # In multi-layer (Conv2 enabled), the same absolute inhibition often over-suppresses activity.
+    # We scale I->E strength by this multiplier when c2_out>0.
+    ei_inh_mult_2layer: float = 0.01
 
     # Legacy local competition hook (kept for ablations)
     local_inhib_enable: bool = False
@@ -87,9 +128,18 @@ class CSCfg:
     theta_plus: float = 0.05
     tau_theta: float = 1e4
 
+    # Temporal sparsity: allow each neuron to spike at most once per sample
+    # (approximate first-spike / time-to-first-spike behavior for rate encoders).
+    first_spike_only: bool = False
+
     # misc (keep parity with FC pipeline overrides)
     log_every: int = 50
     warmup_N: int = 0
+
+    # activity guard (fail-fast for obviously silent networks)
+    # Checked at activity_log_every ticks in experiment_runner.
+    activity_check_after: int = 1000
+    activity_min_spikes_win_mean: float = 1000.0
 
     def torch_device(self) -> torch.device:
         dev = torch.device(self.device)
@@ -114,43 +164,38 @@ def build_encoder_from_cfg(cfg: CSCfg):
     raise ValueError(f"Unknown encoder: {cfg.encoder}")
 
 
-def _spikes_flat_to_hw(spikes: Tensor, device: torch.device) -> Tensor:
-    """Convert encoder output to [T,B,1,28,28] for Conv2dConnection.
+def _spikes_flat_to_hw(spikes: Tensor, device: torch.device, *, C: int = 1, H: int = 28, W: int = 28) -> Tensor:
+    """Convert encoder output to [T,B,C,H,W] for Conv2dConnection.
 
     Accepts encoder outputs:
-    - [T,B,1,28,28] (preferred)
-    - [T, 1, 784] (legacy single)
-    - [T, B, 784]
-    - [T, B, 1, 784]
+    - [T,B,C,H,W] (preferred)
+    - [T, B, N]
+    - [T, B, 1, N]
 
-    Returns:
-    - [T, B, 1, 28, 28]
+    Where N == C*H*W.
     """
     if not torch.is_tensor(spikes):
         spikes = torch.as_tensor(spikes)
     spikes = spikes.to(device=device, dtype=torch.float32, non_blocking=True)
 
     if spikes.ndim == 5:
-        # [T,B,1,28,28]
-        T, B, C, H, W = spikes.shape
-        if (C, H, W) != (1, 28, 28):
-            raise ValueError(f"Expected [T,B,1,28,28], got {tuple(spikes.shape)}")
         return spikes
 
+    exp = int(C) * int(H) * int(W)
     if spikes.ndim == 3:
         T, B, N = spikes.shape
-        if N != 784:
-            raise ValueError(f"Expected last dim 784, got {N}")
+        if N != exp:
+            raise ValueError(f"Expected last dim {exp}, got {N}")
         spikes_tbn = spikes
     elif spikes.ndim == 4:
-        T, B, C, N = spikes.shape
-        if C != 1 or N != 784:
-            raise ValueError(f"Expected [T,B,1,784], got {tuple(spikes.shape)}")
+        T, B, C1, N = spikes.shape
+        if C1 != 1 or N != exp:
+            raise ValueError(f"Expected [T,B,1,{exp}], got {tuple(spikes.shape)}")
         spikes_tbn = spikes[:, :, 0, :]
     else:
         raise ValueError(f"Unexpected spikes ndim={spikes.ndim}")
 
-    return spikes_tbn.view(T, B, 1, 28, 28)
+    return spikes_tbn.view(T, B, int(C), int(H), int(W))
 
 
 def load_csnn_weights_into(net: Network, conn: Connection, lif_layer: LIFNodes, ckpt_path: str) -> None:
@@ -189,24 +234,32 @@ def load_csnn_weights_into(net: Network, conn: Connection, lif_layer: LIFNodes, 
 
 
 def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
-    """Build a 1-conv-layer CSNN.
+    """Build a CSNN.
 
-    Notes:
-    - We keep a single conv layer to stay close to bio STDP setups.
-    - Optional competition: simple per-position winner-take-all (WTA) inhibition.
-      When enabled, after each simulation step we keep only the max-spiking
-      channel at each (h,w) and zero-out the rest.
+    - Base: Conv1 STDP
+    - Optional: Conv2 STDP when cfg.c2_out > 0
+    - Optional: Conv3 STDP when cfg.c2_out > 0 and cfg.c3_out > 0
+
+    Returns (net, input_layer, lif_layer, connection) where lif_layer/connection refer to
+    the *last* conv layer (Conv2 if enabled, else Conv1) for backward compatibility.
+    Additional references are attached to the returned net:
+      - net._csnn_lifs: list[LIFNodes] in forward order
+      - net._csnn_conns: list[Connection] in forward order
     """
+
     device = cfg.torch_device()
 
     net = Network()
 
     # Conv2dConnection requires explicit 3D shapes (C,H,W) on source/target layers.
-    input_layer = Input(shape=(1, 28, 28), traces=True)
+    C_in = int(getattr(cfg, "input_channels", 1))
+    H_in = int(getattr(cfg, "input_h", 28))
+    W_in = int(getattr(cfg, "input_w", 28))
+    input_layer = Input(shape=(C_in, H_in, W_in), traces=True)
 
-    # Conv output spatial size: (28 + 2*pad - kernel)/stride + 1
-    h = (28 + 2 * cfg.c1_pad - cfg.c1_kernel) // cfg.c1_stride + 1
-    w = (28 + 2 * cfg.c1_pad - cfg.c1_kernel) // cfg.c1_stride + 1
+    # Conv output spatial size: (H + 2*pad - kernel)/stride + 1
+    h = (H_in + 2 * cfg.c1_pad - cfg.c1_kernel) // cfg.c1_stride + 1
+    w = (W_in + 2 * cfg.c1_pad - cfg.c1_kernel) // cfg.c1_stride + 1
     conv_lif = LIFNodes(
         shape=(cfg.c1_out, h, w),
         traces=True,
@@ -275,62 +328,91 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
             """
             try:
                 # Optional weight norm (after STDP update inside the step).
+                # IMPORTANT for multi-layer CSNN: normalize *all* conv connections, not only Conv1.
                 if bool(getattr(cfg, "w_norm_enable", False)):
-                    w = conn.w  # [out_ch, in_ch, kH, kW]
-                    if torch.is_tensor(w) and w.ndim == 4:
-                        tgt = float(getattr(cfg, "w_norm_target", 78.4))
-                        eps = 1e-8
-                        sabs = w.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
-                        scale = (tgt / sabs).clamp_max(1.0)
-                        conn.w.data = w * scale
+                    tgt = float(getattr(cfg, "w_norm_target", 78.4))
+                    eps = 1e-8
+                    conns = list(getattr(net, "_csnn_conns", [])) or [conn]
+                    for _c in conns:
+                        w = getattr(_c, "w", None)
+                        if torch.is_tensor(w) and w.ndim == 4 and w.numel() > 0:
+                            sabs = w.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+                            scale = (tgt / sabs).clamp_max(1.0)
+                            _c.w.data = w * scale
 
-                s = conv_lif.s
-                if not (torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0):
+                # Multi-layer CSNN: apply adaptive threshold + competition to *each* conv LIF layer.
+                lifs = list(getattr(net, "_csnn_lifs", [])) or [conv_lif]
+                conns = list(getattr(net, "_csnn_conns", [])) or [conn]
+                if not lifs:
                     return
 
-                # adaptive threshold update (per-timestep)
-                if bool(getattr(cfg, "adapt_thresh_enable", False)):
-                    frozen_stdp = False
-                    try:
-                        ur = getattr(conn, "update_rule", None)
-                        nu = getattr(ur, "nu", None)
-                        if nu is not None and isinstance(nu, (tuple, list)) and len(nu) == 2:
-                            n0 = float(torch.as_tensor(nu[0]).abs().sum().item())
-                            n1 = float(torch.as_tensor(nu[1]).abs().sum().item())
-                            frozen_stdp = (n0 + n1) <= 0.0
-                    except Exception:
+                for li, lif in enumerate(lifs):
+                    s = getattr(lif, "s", None)
+                    if not (torch.is_tensor(s) and s.ndim == 4 and s.numel() > 0):
+                        continue
+
+                    # adaptive threshold update (per-timestep) — per-layer
+                    if bool(getattr(cfg, "adapt_thresh_enable", False)):
+                        # lazy per-layer init
+                        if not hasattr(lif, "theta"):
+                            lif.theta = None
+                        if not hasattr(lif, "thresh_base"):
+                            lif.thresh_base = torch.as_tensor(float(cfg.thresh_init), device=device)
+                        if not hasattr(lif, "thresh"):
+                            lif.thresh = lif.thresh_base
+
+                        c = conns[li] if li < len(conns) else conns[-1]
                         frozen_stdp = False
+                        try:
+                            ur = getattr(c, "update_rule", None)
+                            nu = getattr(ur, "nu", None)
+                            if nu is not None and isinstance(nu, (tuple, list)) and len(nu) == 2:
+                                n0 = float(torch.as_tensor(nu[0]).abs().sum().item())
+                                n1 = float(torch.as_tensor(nu[1]).abs().sum().item())
+                                frozen_stdp = (n0 + n1) <= 0.0
+                        except Exception:
+                            frozen_stdp = False
 
-                    theta = conv_lif.theta
-                    if (theta is None) or (not torch.is_tensor(theta)) or (theta.ndim != 3):
-                        # [C,H,W]
-                        theta = torch.zeros_like(s[0])
+                        theta = getattr(lif, "theta", None)
+                        if (theta is None) or (not torch.is_tensor(theta)) or (theta.ndim != 3):
+                            theta = torch.zeros_like(s[0])  # [C,H,W]
 
-                    if not frozen_stdp:
-                        tau = float(getattr(cfg, "tau_theta", 1e4))
-                        theta = theta * (1.0 - 1.0 / max(1.0, tau))
-                        # s is [B,C,H,W]; update theta using batch-sum spikes at this timestep
-                        theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach().sum(dim=0)
-                        theta = theta.clamp_(min=0.0, max=10.0)
-                        conv_lif.theta = theta
+                        if not frozen_stdp:
+                            tau = float(getattr(cfg, "tau_theta", 1e4))
+                            theta = theta * (1.0 - 1.0 / max(1.0, tau))
+                            theta = theta + float(getattr(cfg, "theta_plus", 0.05)) * s.detach().sum(dim=0)
+                            theta = theta.clamp_(min=0.0, max=10.0)
+                            lif.theta = theta
 
-                    conv_lif.thresh = conv_lif.thresh_base + theta
+                        lif.thresh = lif.thresh_base + theta
 
-                # competition
-                if bool(getattr(cfg, "ei_enable", False)) and inhib_lif is not None:
-                    exc = float(getattr(cfg, "ei_exc", 22.5))
-                    inh = float(getattr(cfg, "ei_inh", 120.0))
-                    inhib_lif.forward(exc * s.detach())
-                    i_s = inhib_lif.s.detach().to(s.dtype)
-                    conv_lif.v = conv_lif.v - inh * i_s
-                    conv_lif.s = conv_lif.v >= conv_lif.thresh
-                elif bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
-                    m = _winner_mask(s)
-                    if bool(getattr(cfg, "wta_enable", False)):
-                        conv_lif.s = s * m.to(s.dtype)
-                    elif bool(getattr(cfg, "local_inhib_enable", False)):
-                        g = float(getattr(cfg, "local_inhib_strength", 0.7))
-                        conv_lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
+                    # competition
+                    if li == 0 and bool(getattr(cfg, "ei_enable", False)) and inhib_lif is not None:
+                        # EI currently implemented only for Conv1.
+                        exc = float(getattr(cfg, "ei_exc", 22.5))
+                        inh = float(getattr(cfg, "ei_inh", 120.0))
+                        try:
+                            if int(getattr(cfg, "c2_out", 0) or 0) > 0:
+                                inh *= float(getattr(cfg, "ei_inh_mult_2layer", 0.01))
+                        except Exception:
+                            pass
+                        inhib_lif.forward(exc * s.detach())
+                        i_s = inhib_lif.s.detach().to(s.dtype)
+                        lif.v = lif.v - inh * i_s
+
+                        # Optional WTA after EI: keep only per-position winners.
+                        if bool(getattr(cfg, "wta_enable", False)):
+                            s2 = getattr(lif, "s", None)
+                            if torch.is_tensor(s2) and s2.ndim == 4:
+                                m = _winner_mask(s2)
+                                lif.s = s2.to(s.dtype) * m.to(s.dtype)
+                    elif bool(getattr(cfg, "wta_enable", False)) or bool(getattr(cfg, "local_inhib_enable", False)):
+                        m = _winner_mask(s)
+                        if bool(getattr(cfg, "wta_enable", False)):
+                            lif.s = s * m.to(s.dtype)
+                        elif bool(getattr(cfg, "local_inhib_enable", False)):
+                            g = float(getattr(cfg, "local_inhib_strength", 0.7))
+                            lif.s = s * (m.to(s.dtype) + (1.0 - g) * (~m).to(s.dtype))
             except Exception:
                 pass
 
@@ -356,11 +438,54 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                 rest = {k: v for k, v in kwargs.items() if k not in ("inputs", "time")}
                 out = None
                 x = inputs["Input"]
+
+                # Optional first-spike-only mode (per sample): once a neuron has spiked, keep it
+                # refractory for the rest of the sample. Helps reduce spike avalanches in deep layers.
+                fs_only = bool(getattr(cfg, "first_spike_only", False))
+                fired = None
+                if fs_only:
+                    try:
+                        lifs0 = list(getattr(net, "_csnn_lifs", [])) or [conv_lif]
+                        fired = {}
+                        for lif in lifs0:
+                            s0 = getattr(lif, "s", None)
+                            if torch.is_tensor(s0) and s0.ndim == 4:
+                                fired[id(lif)] = torch.zeros_like(s0, dtype=torch.bool)
+                    except Exception:
+                        fired = None
+
                 for t in range(time):
                     step_inputs = dict(inputs)
                     step_inputs["Input"] = x[t : t + 1]
                     out = _orig_run(inputs=step_inputs, time=1, **rest)
                     _after_step_hooks()
+
+                    if fs_only and fired:
+                        try:
+                            lifs1 = list(getattr(net, "_csnn_lifs", [])) or [conv_lif]
+                            for lif in lifs1:
+                                s = getattr(lif, "s", None)
+                                if not (torch.is_tensor(s) and s.ndim == 4):
+                                    continue
+                                key = id(lif)
+                                if key not in fired:
+                                    fired[key] = torch.zeros_like(s, dtype=torch.bool)
+                                prev = fired[key]
+                                now = s.detach() > 0
+                                fired[key] = prev | now
+
+                                # Keep already-fired neurons silent for the rest of the sample.
+                                rc = getattr(lif, "refrac_count", None)
+                                if torch.is_tensor(rc) and rc.shape == s.shape:
+                                    # Set refractory to remaining timesteps.
+                                    rem = int(max(1, time - (t + 1)))
+                                    rc = torch.where(fired[key], torch.as_tensor(rem, device=rc.device, dtype=rc.dtype), rc)
+                                    lif.refrac_count = rc
+                                v = getattr(lif, "v", None)
+                                if torch.is_tensor(v) and v.shape == s.shape:
+                                    lif.v = torch.where(fired[key], torch.zeros_like(v), v)
+                        except Exception:
+                            pass
                 return out
 
             # Fallback: single call
@@ -405,6 +530,104 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
 
     net.add_connection(conn, source="Input", target="Conv1")
 
+    # Optional Conv2
+    conv2_lif = None
+    conn2 = None
+    if int(getattr(cfg, "c2_out", 0)) > 0:
+        c2_out = int(getattr(cfg, "c2_out", 0))
+        c2_k = int(getattr(cfg, "c2_kernel", 3))
+        c2_s = int(getattr(cfg, "c2_stride", 2))
+        c2_p = int(getattr(cfg, "c2_pad", 1))
+
+        # Conv2 output spatial size from Conv1 (h,w)
+        h2 = (h + 2 * c2_p - c2_k) // c2_s + 1
+        w2 = (w + 2 * c2_p - c2_k) // c2_s + 1
+        conv2_lif = LIFNodes(
+            shape=(c2_out, h2, w2),
+            traces=True,
+            thresh=float(cfg.thresh_init),
+            rest=float(cfg.rest_val),
+            reset=float(cfg.reset_val),
+            refrac=int(cfg.refrac_val),
+            tc_decay=float(cfg.tau_val),
+        )
+        net.add_layer(conv2_lif, name="Conv2")
+
+        conn2 = Conv2dConnection(
+            source=conv_lif,
+            target=conv2_lif,
+            kernel_size=c2_k,
+            stride=c2_s,
+            padding=c2_p,
+            wmin=0.0,
+            wmax=1.0,
+        )
+        try:
+            conn2.w.data.uniform_(0.0, 0.3)
+            if bool(getattr(cfg, "w_norm_enable", False)):
+                tgt = float(getattr(cfg, "w_norm_target", 78.4))
+                eps = 1e-8
+                sabs = conn2.w.data.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+                conn2.w.data.mul_((tgt / sabs).clamp_max(1.0))
+        except Exception:
+            pass
+
+        conn2.update_rule = WeightDependentPostPre(
+            connection=conn2,
+            nu=(torch.tensor(nu_pre), torch.tensor(nu_post)),
+            weight_decay=1.0,
+        )
+        net.add_connection(conn2, source="Conv1", target="Conv2")
+
+    # Optional Conv3 (only if Conv2 exists)
+    conv3_lif = None
+    conn3 = None
+    if (conv2_lif is not None) and (conn2 is not None) and (int(getattr(cfg, "c3_out", 0)) > 0):
+        c3_out = int(getattr(cfg, "c3_out", 0))
+        c3_k = int(getattr(cfg, "c3_kernel", 3))
+        c3_s = int(getattr(cfg, "c3_stride", 2))
+        c3_p = int(getattr(cfg, "c3_pad", 1))
+
+        # Conv3 output spatial size from Conv2 (h2,w2)
+        h3 = (h2 + 2 * c3_p - c3_k) // c3_s + 1
+        w3 = (w2 + 2 * c3_p - c3_k) // c3_s + 1
+        conv3_lif = LIFNodes(
+            shape=(c3_out, h3, w3),
+            traces=True,
+            thresh=float(cfg.thresh_init),
+            rest=float(cfg.rest_val),
+            reset=float(cfg.reset_val),
+            refrac=int(cfg.refrac_val),
+            tc_decay=float(cfg.tau_val),
+        )
+        net.add_layer(conv3_lif, name="Conv3")
+
+        conn3 = Conv2dConnection(
+            source=conv2_lif,
+            target=conv3_lif,
+            kernel_size=c3_k,
+            stride=c3_s,
+            padding=c3_p,
+            wmin=0.0,
+            wmax=1.0,
+        )
+        try:
+            conn3.w.data.uniform_(0.0, 0.3)
+            if bool(getattr(cfg, "w_norm_enable", False)):
+                tgt = float(getattr(cfg, "w_norm_target", 78.4))
+                eps = 1e-8
+                sabs = conn3.w.data.abs().sum(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+                conn3.w.data.mul_((tgt / sabs).clamp_max(1.0))
+        except Exception:
+            pass
+
+        conn3.update_rule = WeightDependentPostPre(
+            connection=conn3,
+            nu=(torch.tensor(nu_pre), torch.tensor(nu_post)),
+            weight_decay=1.0,
+        )
+        net.add_connection(conn3, source="Conv2", target="Conv3")
+
 
     if hasattr(net, "to"):
         net.to(device)
@@ -438,4 +661,21 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
     _move_layer_state_(conv_lif)
     _move_conn_state_(conn)
 
-    return net, input_layer, conv_lif, conn
+    if conv2_lif is not None and conn2 is not None:
+        _move_layer_state_(conv2_lif)
+        _move_conn_state_(conn2)
+
+    if conv3_lif is not None and conn3 is not None:
+        _move_layer_state_(conv3_lif)
+        _move_conn_state_(conn3)
+
+    # Attach references for multi-layer training control.
+    lifs = [conv_lif] + ([conv2_lif] if conv2_lif is not None else []) + ([conv3_lif] if conv3_lif is not None else [])
+    conns = [conn] + ([conn2] if conn2 is not None else []) + ([conn3] if conn3 is not None else [])
+    net._csnn_lifs = lifs
+    net._csnn_conns = conns
+
+    # Backward-compat return: last layer/connection.
+    last_lif = conv3_lif if conv3_lif is not None else (conv2_lif if conv2_lif is not None else conv_lif)
+    last_conn = conn3 if conn3 is not None else (conn2 if conn2 is not None else conn)
+    return net, input_layer, last_lif, last_conn

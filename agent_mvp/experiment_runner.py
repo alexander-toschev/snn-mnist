@@ -120,28 +120,106 @@ def run_single_experiment(
     try:
         if arch == "csnn":
             # Minimal CSNN training loop (v0): 1 conv layer + STDP.
-            from bindsnet.datasets import MNIST
             from torchvision import transforms
             from bindsnet.network.monitors import Monitor
+            from datasets_vision import make_vision_datasets
 
             net, input_layer, lif_layer, connection = build_csnn(cfg)
             encoder = build_csnn_encoder(cfg)
             device = cfg.torch_device()
+            # Online homeostasis controller (optional): adjusts Poisson rate_scale to keep spikes/sample in band.
+            homeo = None
+            try:
+                from activity_homeostasis import HomeostasisCfg, SpikesHomeostasis
+                homeo_cfg = HomeostasisCfg(
+                    enable=bool(getattr(cfg, "homeo_enable", False)),
+                    spikes_lo=float(getattr(cfg, "homeo_spikes_lo", 3000.0)),
+                    spikes_hi=float(getattr(cfg, "homeo_spikes_hi", 5000.0)),
+                    spikes_target=float(getattr(cfg, "homeo_spikes_target", 4000.0)),
+                    ema_alpha=float(getattr(cfg, "homeo_ema_alpha", 0.01)),
+                    update_every=int(getattr(cfg, "homeo_update_every", 25)),
+                    warmup=int(getattr(cfg, "homeo_warmup", 200)),
+                    gain=float(getattr(cfg, "homeo_gain", 0.25)),
+                    rate_mul_min=float(getattr(cfg, "homeo_rate_mul_min", 0.3)),
+                    rate_mul_max=float(getattr(cfg, "homeo_rate_mul_max", 3.0)),
+                )
+                # Only makes sense for Poisson encoder which exposes rate_scale.
+                if hasattr(encoder, "rate_scale"):
+                    homeo = SpikesHomeostasis(homeo_cfg, base_rate_scale=float(getattr(cfg, "poisson_rate_scale", 0.0)))
+            except Exception:
+                homeo = None
             # Ensure the conv input adapter is available even if label_map is skipped.
             from csnn_mnist_net import _spikes_flat_to_hw
 
             transform = transforms.Compose([transforms.ToTensor()])
-            ds = MNIST(root="./data", train=True, download=True, transform=transform)
+            ds_train, _ds_test = make_vision_datasets(dataset=str(getattr(cfg, "dataset", "mnist")), root="./data", transform=transform)
+            ds = ds_train
             n_train = min(int(getattr(cfg, "N", 12000)), len(ds))
             T = int(cfg.time)
+
+            # Shuffle training order for better class mixing (important for CIFAR etc.).
+            # Controlled by cfg.shuffle (default True).
+            shuffle = bool(getattr(cfg, "shuffle", True))
+            if shuffle:
+                g = torch.Generator(device="cpu")
+                try:
+                    g.manual_seed(int(getattr(cfg, "seed", 42)))
+                except Exception:
+                    g.manual_seed(42)
+                order = torch.randperm(len(ds), generator=g).tolist()
+            else:
+                order = list(range(len(ds)))
 
             mon_X = Monitor(input_layer, state_vars=("s",), time=T)
             mon_H = Monitor(lif_layer, state_vars=("s",), time=T)
             net.add_monitor(mon_X, name="mon_X")
             net.add_monitor(mon_H, name="mon_H")
 
+            # Optional per-layer monitors for multi-layer CSNN (Conv1/2/3), for debugging dynamics.
+            mon_layers = {}
+            last_layer_name = None
+            try:
+                csnn_lifs = list(getattr(net, "_csnn_lifs", []) or [])
+                if len(csnn_lifs) >= 2:
+                    for li, lif in enumerate(csnn_lifs):
+                        lname = f"Conv{li+1}"
+                        mon = Monitor(lif, state_vars=("s",), time=T)
+                        net.add_monitor(mon, name=f"mon_{lname}")
+                        mon_layers[lname] = mon
+                    if mon_layers:
+                        last_layer_name = list(mon_layers.keys())[-1]
+            except Exception:
+                mon_layers = {}
+                last_layer_name = None
+
+            # Multi-layer CSNN support: build_csnn attaches net._csnn_conns in forward order.
+            csnn_conns = list(getattr(net, "_csnn_conns", [])) or [connection]
+            csnn_nu_orig = []
+            csnn_nu_zero = []
+            for c in csnn_conns:
+                ur = getattr(c, "update_rule", None)
+                nu = getattr(ur, "nu", None)
+                if isinstance(nu, (tuple, list)) and len(nu) == 2:
+                    csnn_nu_orig.append((nu[0].clone(), nu[1].clone()))
+                    z0 = nu[0].detach().clone().fill_(0.0)
+                    z1 = nu[1].detach().clone().fill_(0.0)
+                    csnn_nu_zero.append((z0, z1))
+                else:
+                    csnn_nu_orig.append(None)
+                    csnn_nu_zero.append(None)
+
             S_out = 0
             last_report = time.time()
+            # For stable activity logging (windowed stats)
+            act_win_sum = 0
+            act_win_n = 0
+            act_win_min = None
+            act_win_max = None
+
+            # Per-layer windowed stats (only when mon_layers enabled)
+            act_layers_sum = {k: 0 for k in mon_layers}
+            act_layers_min = {k: None for k in mon_layers}
+            act_layers_max = {k: None for k in mon_layers}
             # Resume: skip training if resume_checkpoint provided.
             if getattr(cfg, "resume_checkpoint", None):
                 _status_update(stage="resume_checkpoint")
@@ -153,14 +231,64 @@ def run_single_experiment(
             activity_log_path = run_dir / "activity.jsonl"
 
             for i in range(n_train):
-                x = ds[i]["image"].to(device)
+                idx = order[i]
+                x = ds[idx]["image"].to(device)
                 spikes = encoder(x)
                 # spikes should already be [T,1,1,28,28] when encoder_out_format=TBNCHW
                 if hasattr(spikes, "dim") and spikes.dim() == 3:
-                    spikes_hw = _spikes_flat_to_hw(spikes, device)
+                    spikes_hw = _spikes_flat_to_hw(
+                        spikes,
+                        device,
+                        C=int(getattr(cfg, "input_channels", 1)),
+                        H=int(getattr(cfg, "input_h", 28)),
+                        W=int(getattr(cfg, "input_w", 28)),
+                    )
                 else:
                     spikes_hw = spikes
+                # Greedy layer-wise STDP when multiple conv connections exist.
+                # - For 2 conv layers: train Conv1 for greedy_n1 samples, then Conv2.
+                # - For 3 conv layers: train Conv1 for greedy_n1, then Conv2 for greedy_n2, then Conv3 for the rest.
+                if bool(getattr(cfg, "greedy_enable", False)) and (len(csnn_conns) >= 2):
+                    # Only apply greedy when nu tensors are available.
+                    if all(x is not None for x in csnn_nu_orig[: min(3, len(csnn_conns))]):
+                        n1 = int(getattr(cfg, "greedy_n1", 2500))
+                        if len(csnn_conns) >= 3:
+                            n2 = int(getattr(cfg, "greedy_n2", n1))
+                            if i < n1:
+                                # Train Conv1 only.
+                                csnn_conns[0].update_rule.nu = csnn_nu_orig[0]
+                                csnn_conns[1].update_rule.nu = csnn_nu_zero[1]
+                                csnn_conns[2].update_rule.nu = csnn_nu_zero[2]
+                            elif i < (n1 + n2):
+                                # Train Conv2 only.
+                                csnn_conns[0].update_rule.nu = csnn_nu_zero[0]
+                                csnn_conns[1].update_rule.nu = csnn_nu_orig[1]
+                                csnn_conns[2].update_rule.nu = csnn_nu_zero[2]
+                            else:
+                                # Train Conv3 only.
+                                csnn_conns[0].update_rule.nu = csnn_nu_zero[0]
+                                csnn_conns[1].update_rule.nu = csnn_nu_zero[1]
+                                csnn_conns[2].update_rule.nu = csnn_nu_orig[2]
+                        else:
+                            if i < n1:
+                                csnn_conns[0].update_rule.nu = csnn_nu_orig[0]
+                                csnn_conns[1].update_rule.nu = csnn_nu_zero[1]
+                            else:
+                                csnn_conns[0].update_rule.nu = csnn_nu_zero[0]
+                                csnn_conns[1].update_rule.nu = csnn_nu_orig[1]
+
                 net.run(inputs={"Input": spikes_hw}, time=T)
+
+                # Per-layer spike counts (sum over time) if per-layer monitors are available.
+                layer_spikes = {}
+                if mon_layers:
+                    for lname, mon in mon_layers.items():
+                        try:
+                            sL = mon.get("s")  # [T,B,C,H,W]
+                            layer_spikes[lname] = int(sL.sum().item()) if torch.is_tensor(sL) else None
+                            mon.reset_state_variables()
+                        except Exception:
+                            layer_spikes[lname] = None
 
                 # Per-sample spike count: sum over time from monitor, then reset monitor buffers.
                 ssum = None
@@ -172,13 +300,68 @@ def run_single_experiment(
                 except Exception:
                     ssum = None
 
+                # Prefer last-layer per-layer monitor for ssum (more explicit in multi-layer mode).
+                if (ssum is None) and layer_spikes and last_layer_name in layer_spikes:
+                    try:
+                        if layer_spikes[last_layer_name] is not None:
+                            ssum = int(layer_spikes[last_layer_name])
+                    except Exception:
+                        pass
+
                 if ssum is None:
                     # Fallback: last-step spikes only.
                     s_layer = getattr(lif_layer, "s", None)
                     ssum = int(s_layer.sum().item()) if torch.is_tensor(s_layer) else 0
                 S_out += ssum
 
+                # Update windowed activity stats (more stable than single-sample snapshots)
+                act_win_sum += int(ssum)
+                act_win_n += 1
+                act_win_min = int(ssum) if act_win_min is None else min(act_win_min, int(ssum))
+                act_win_max = int(ssum) if act_win_max is None else max(act_win_max, int(ssum))
+
+                # Per-layer windowed stats
+                if layer_spikes and act_layers_sum:
+                    for lname, v in layer_spikes.items():
+                        if v is None:
+                            continue
+                        act_layers_sum[lname] += int(v)
+                        act_layers_min[lname] = int(v) if act_layers_min[lname] is None else min(act_layers_min[lname], int(v))
+                        act_layers_max[lname] = int(v) if act_layers_max[lname] is None else max(act_layers_max[lname], int(v))
+
+                # Homeostasis: update encoder rate scale for next samples.
+                homeo_info = None
+                if homeo is not None:
+                    try:
+                        homeo_info = homeo.observe(float(ssum), int(i + 1))
+                        # Apply for subsequent samples.
+                        if homeo_info and hasattr(encoder, "rate_scale"):
+                            encoder.rate_scale = float(homeo_info.get("homeo_rate_scale", encoder.rate_scale))
+                    except Exception:
+                        homeo_info = None
+
                 if activity_log_every and ((i + 1) % int(activity_log_every) == 0):
+                    # --- Activity guard: abort early if the network is effectively silent ---
+                    try:
+                        win_mean_guard = float(act_win_sum) / max(1, act_win_n)
+                        in_spikes_guard = None
+                        if torch.is_tensor(spikes_hw):
+                            in_spikes_guard = int(spikes_hw.sum().item())
+                        check_after = int(getattr(cfg, "activity_check_after", 1000))
+                        min_win_mean = float(getattr(cfg, "activity_min_spikes_win_mean", 1000.0))
+                        if (int(i + 1) >= check_after) and (in_spikes_guard is None or int(in_spikes_guard) > 0):
+                            if win_mean_guard < min_win_mean:
+                                msg = (
+                                    f"low activity: spikes_win_mean={win_mean_guard:.3f} < {min_win_mean:.3f} "
+                                    f"at i={i+1} (in_spikes={in_spikes_guard})"
+                                )
+                                _status_update(stage="train_failed", error=msg, error_type="RuntimeError")
+                                raise RuntimeError(msg)
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
+
                     try:
                         in_spikes = None
                         if torch.is_tensor(spikes_hw):
@@ -221,17 +404,63 @@ def run_single_experiment(
                         theta = getattr(lif_layer, "theta", None)
                         if theta is not None and hasattr(theta, "mean"):
                             theta_mean = float(theta.mean().item())
+                        win_mean = (float(act_win_sum) / max(1, act_win_n))
+
+                        layers_rec = None
+                        if act_layers_sum and act_win_n > 0:
+                            try:
+                                layers_rec = {}
+                                for lname in act_layers_sum:
+                                    layers_rec[lname] = {
+                                        "spikes_win_mean": float(act_layers_sum[lname]) / float(max(1, act_win_n)),
+                                        "spikes_win_min": int(act_layers_min[lname]) if act_layers_min[lname] is not None else None,
+                                        "spikes_win_max": int(act_layers_max[lname]) if act_layers_max[lname] is not None else None,
+                                    }
+                            except Exception:
+                                layers_rec = None
+
                         rec = {
                             "i": int(i + 1),
                             "spikes": int(ssum),
                             "spikes_per_sample": float(ssum),
+                            "spikes_win_mean": float(win_mean),
+                            "spikes_win_min": int(act_win_min) if act_win_min is not None else None,
+                            "spikes_win_max": int(act_win_max) if act_win_max is not None else None,
                             "theta_mean": theta_mean,
                             "t": utc_now_iso(),
                             **rec_extra,
                         }
+                        if layers_rec is not None:
+                            rec["layers"] = layers_rec
+                        if homeo_info:
+                            rec.update(homeo_info)
                         with open(activity_log_path, "a", encoding="utf-8") as f:
                             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                        _status_update(stage="train", activity_spikes=float(ssum), activity_theta_mean=theta_mean)
+                        _status_update(
+                            stage="train",
+                            activity_spikes=float(ssum),
+                            activity_spikes_win_mean=float(win_mean),
+                            activity_spikes_win_min=(int(act_win_min) if act_win_min is not None else None),
+                            activity_spikes_win_max=(int(act_win_max) if act_win_max is not None else None),
+                            activity_theta_mean=theta_mean,
+                            activity_homeo_rate_scale=(float(homeo_info.get("homeo_rate_scale")) if homeo_info else None),
+                            activity_homeo_ema_spikes=(float(homeo_info.get("homeo_ema_spikes")) if homeo_info else None),
+                            activity_homeo_rate_mul=(float(homeo_info.get("homeo_rate_mul")) if homeo_info else None),
+                            activity_homeo_action=(homeo_info.get("homeo_action") if homeo_info else None),
+                        )
+
+                        # Reset window at each activity log tick so stats reflect the last window.
+                        act_win_sum = 0
+                        act_win_n = 0
+                        act_win_min = None
+                        act_win_max = None
+
+                        # Reset per-layer windows.
+                        if act_layers_sum:
+                            for lname in act_layers_sum:
+                                act_layers_sum[lname] = 0
+                                act_layers_min[lname] = None
+                                act_layers_max[lname] = None
                     except Exception:
                         pass
 
@@ -247,10 +476,10 @@ def run_single_experiment(
 
                 if vote_every > 0 and vote_calib > 0 and ((i + 1) % vote_every == 0):
                     try:
-                        from counts_readout import make_mnist_datasets, collect_counts_plus_fast
+                        from counts_readout import make_vision_datasets, collect_counts_plus_fast
 
                         _status_update(stage="vote_check", i=int(i + 1), n=int(n_train), pct=float(100.0 * (i + 1) / max(1, n_train)))
-                        ds_train_chk, ds_test_chk = make_mnist_datasets()
+                        ds_train_chk, ds_test_chk = make_vision_datasets(dataset=str(getattr(cfg, "dataset", "mnist")))
 
                         # We compute proportional vote accuracy by reusing eval_readouts_from_net with env flag.
                         os.environ["SNN_PROPORTIONAL_VOTE"] = "1"
@@ -275,9 +504,13 @@ def run_single_experiment(
                 # --- Zalipe detection: detect obviously broken dynamics and fail fast ---
                 if (i + 1) % max(1, int(activity_log_every or 1000)) == 0:
                     try:
-                        # If weights look constant and voltages are all zero, abort early.
-                        if (wmin is not None and wmax is not None and abs(wmax - wmin) < 1e-8) and (v_max is not None and abs(v_max) < 1e-8):
-                            raise RuntimeError(f"zalipe detected: w_min==w_max=={wmin} and v_max==0 at i={i+1}")
+                        # If weights look constant AND the layer is effectively silent, abort early.
+                        # Note: v can legitimately be 0 even when spiking (reset-on-spike), so use spikes.
+                        if (wmin is not None and wmax is not None and abs(wmax - wmin) < 1e-8):
+                            if (ssum is not None) and int(ssum) == 0 and (in_spikes is None or int(in_spikes) > 0):
+                                raise RuntimeError(
+                                    f"zalipe detected: w_min==w_max=={wmin} and spikes==0 at i={i+1}"
+                                )
                     except Exception as e:
                         _status_update(stage="train_failed", error=str(e), error_type=type(e).__name__)
                         raise
@@ -334,8 +567,37 @@ def run_single_experiment(
             if arch == "csnn":
                 from csnn_mnist_net import _spikes_flat_to_hw
 
+                # Note: encoder_rate_boost is used in counts collection; for label_map we also apply
+                # it by temporarily scaling encoder.rate_scale. This keeps PoissonEncoder's
+                # deterministic mode behaviour consistent with the rest of the pipeline.
+                _lm_dev = cfg.torch_device()
+                _lm_C = int(getattr(cfg, "input_channels", 1))
+                _lm_H = int(getattr(cfg, "input_h", 28))
+                _lm_W = int(getattr(cfg, "input_w", 28))
+                _lm_boost = float(getattr(cfg, "encoder_rate_boost", 1.0))
+                _lm_use_boost = (
+                    (str(getattr(cfg, "encoder", "poisson")).lower() == "poisson")
+                    and (_lm_boost != 1.0)
+                    and hasattr(encoder, "rate_scale")
+                )
+
                 def _enc_hw(x):
-                    return _spikes_flat_to_hw(encoder(x), cfg.torch_device())
+                    if _lm_use_boost:
+                        old = float(getattr(encoder, "rate_scale"))
+                        try:
+                            encoder.rate_scale = old * _lm_boost
+                            sp = encoder(x)
+                        finally:
+                            encoder.rate_scale = old
+                        return _spikes_flat_to_hw(sp, _lm_dev, C=_lm_C, H=_lm_H, W=_lm_W)
+
+                    return _spikes_flat_to_hw(
+                        encoder(x),
+                        _lm_dev,
+                        C=_lm_C,
+                        H=_lm_H,
+                        W=_lm_W,
+                    )
 
                 label_map = build_label_map(
                     net,
@@ -346,6 +608,7 @@ def run_single_experiment(
                     T=cfg.time,
                     top_k=max(1, int(getattr(cfg, "top_k", 0)) if int(getattr(cfg, "top_k", 0)) > 0 else 3),
                     seed=cfg.seed,
+                    dataset=str(getattr(cfg, "dataset", "mnist")),
                 )
             else:
                 label_map = build_label_map(
@@ -357,6 +620,7 @@ def run_single_experiment(
                     T=cfg.time,
                     top_k=max(1, int(cfg.top_k) if int(cfg.top_k) > 0 else 3),
                     seed=cfg.seed,
+                    dataset=str(getattr(cfg, "dataset", "mnist")),
                 )
             label_map_path = run_dir / "label_map.pt"
             save_label_map(
@@ -372,6 +636,24 @@ def run_single_experiment(
                 "assigned_neurons": int((label_map >= 0).sum().item()),
                 "total_neurons": int(label_map.numel()),
             }
+            # Extra metric: neurons-per-class distribution (assigned neurons only).
+            try:
+                lm = torch.as_tensor(label_map, dtype=torch.long)
+                assigned = lm[lm >= 0]
+                n_classes = int(assigned.max().item()) + 1 if assigned.numel() > 0 else 0
+                if n_classes > 0:
+                    counts = torch.bincount(assigned.cpu(), minlength=n_classes).tolist()
+                    label_map_summary["neurons_per_class"] = {str(i): int(c) for i, c in enumerate(counts)}
+                    # Basic dispersion stats for quick scanning.
+                    mean = float(sum(counts)) / float(max(1, len(counts)))
+                    var = float(sum((c - mean) ** 2 for c in counts)) / float(max(1, len(counts)))
+                    cv = (var ** 0.5) / mean if mean > 0 else None
+                    label_map_summary["neurons_per_class_mean"] = mean
+                    label_map_summary["neurons_per_class_min"] = int(min(counts)) if counts else None
+                    label_map_summary["neurons_per_class_max"] = int(max(counts)) if counts else None
+                    label_map_summary["neurons_per_class_cv"] = float(cv) if cv is not None else None
+            except Exception:
+                pass
 
         eval_summary = None
         if not skip_eval:

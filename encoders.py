@@ -22,32 +22,35 @@ import torch
 from torch import Tensor
 
 
-def _normalize_mnist_shape(image: Tensor) -> tuple[Tensor, bool]:
-    """Return (x, had_batch) where x is [B,28,28] and had_batch indicates whether input
-    was originally a batch (B>1 or explicit batch dim).
+def _normalize_image_chw(image: Tensor) -> tuple[Tensor, bool]:
+    """Return (x, had_batch) where x is [B,C,H,W].
 
     Accepts:
-      [28,28], [1,28,28], [B,28,28], [B,1,28,28]
+      - [H,W]
+      - [C,H,W]
+      - [1,H,W]
+      - [B,H,W]
+      - [B,1,H,W]
+      - [B,C,H,W]
     """
     x = image
 
-    # [B,1,28,28] -> [B,28,28]
-    if x.ndim == 4 and x.shape[1] == 1:
-        x = x.squeeze(1)
-
-    # [1,28,28] could be single or batch of 1; treat as single unless caller provided batch explicitly.
-    if x.ndim == 3 and x.shape[0] == 1:
-        # ambiguous; keep it as single by default (had_batch=False)
-        # convert to [1,28,28] batch form but mark as non-batch
-        return x, False
-
-    # [B,28,28]
-    if x.ndim == 3:
-        return x, True
-
-    # [28,28] -> [1,28,28]
+    # [H,W] -> [1,1,H,W]
     if x.ndim == 2:
-        return x.unsqueeze(0), False
+        return x.unsqueeze(0).unsqueeze(0), False
+
+    # [C,H,W] -> [1,C,H,W]
+    if x.ndim == 3:
+        # Ambiguous case: could be [B,H,W] for grayscale batches. We assume channel-first
+        # single image when x.shape[0] is a small channel count (1 or 3).
+        if x.shape[0] in (1, 3):
+            return x.unsqueeze(0), False
+        # Otherwise treat as [B,H,W] grayscale batch.
+        return x.unsqueeze(1), True
+
+    # [B,C,H,W] or [B,1,H,W]
+    if x.ndim == 4:
+        return x, True
 
     raise ValueError(f"Unsupported image shape: {tuple(image.shape)}")
 
@@ -59,15 +62,15 @@ def _normalize_range(x: Tensor) -> Tensor:
     return x.clamp(0, 1)
 
 
-def _format_output(spikes_tbn: Tensor, had_batch: bool, out_format: str) -> Tensor:
-    """spikes_tbn is [T,B,784]."""
+def _format_output(spikes_tbn: Tensor, *, had_batch: bool, out_format: str, C: int, H: int, W: int) -> Tensor:
+    """spikes_tbn is [T,B,N] where N=C*H*W."""
     out_format = out_format.lower()
     if out_format == "tbn":
         return spikes_tbn
     if out_format == "tbn1":
         return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], 1, spikes_tbn.shape[2])
     if out_format == "tbnchw":
-        return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], 1, 28, 28)
+        return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], C, H, W)
     if out_format == "auto":
         if had_batch:
             return spikes_tbn.view(spikes_tbn.shape[0], spikes_tbn.shape[1], 1, spikes_tbn.shape[2])
@@ -90,25 +93,26 @@ class LatencyEncoder:
 
     @torch.no_grad()
     def __call__(self, image: Tensor) -> Tensor:
-        x, had_batch = _normalize_mnist_shape(image)
+        x, had_batch = _normalize_image_chw(image)
         x = _normalize_range(x)
 
-        B = x.shape[0]
+        B, C, H, W = x.shape
         T = self.time
         dev = x.device
 
-        x_flat = x.reshape(B, -1)  # [B,784]
+        x_flat = x.reshape(B, -1)  # [B,N]
         mask = x_flat >= self.x_min
         t_fire = torch.floor((1.0 - x_flat) * (T - 1)).to(torch.long)  # [B,784]
 
-        spikes = torch.zeros((T, B, 784), dtype=torch.float32, device=dev)
+        N = x_flat.shape[1]
+        spikes = torch.zeros((T, B, N), dtype=torch.float32, device=dev)
 
         b_idx = torch.arange(B, device=dev)[:, None].expand(B, 784)
-        n_idx = torch.arange(784, device=dev)[None, :].expand(B, 784)
+        n_idx = torch.arange(N, device=dev)[None, :].expand(B, N)
 
         # Ставим импульсы только там, где пиксель “значимый” (mask=True)
         spikes[t_fire[mask], b_idx[mask], n_idx[mask]] = 1.0
-        return _format_output(spikes, had_batch=had_batch, out_format=self.out_format)
+        return _format_output(spikes, had_batch=had_batch, out_format=self.out_format, C=C, H=H, W=W)
 
 
 class PoissonEncoder:
@@ -143,23 +147,25 @@ class PoissonEncoder:
 
     @torch.no_grad()
     def __call__(self, image: Tensor) -> Tensor:
-        x, had_batch = _normalize_mnist_shape(image)
+        x, had_batch = _normalize_image_chw(image)
         x = _normalize_range(x)
 
         dev = x.device
-        B = x.shape[0]
+        B, C, H, W = x.shape
         T = self.T
 
-        x_flat = x.reshape(B, -1)  # [B,784]
+        x_flat = x.reshape(B, -1)  # [B,N]
         lam = x_flat * self.rate_scale
-        p = 1.0 - torch.exp(-lam)  # [B,784]
+        p = 1.0 - torch.exp(-lam)  # [B,N]
+
+        N = x_flat.shape[1]
 
         if not self.deterministic:
-            rand = torch.rand((T, B, 784), device=dev)
+            rand = torch.rand((T, B, N), device=dev)
         else:
             # Deterministic pseudo-random stream derived from image content (no per-sample Generator)
-            q = (x_flat * 255.0).to(torch.int64)  # [B,784]
-            idx = torch.arange(784, device=dev, dtype=torch.int64)[None, :]  # [1,784]
+            q = (x_flat * 255.0).to(torch.int64)  # [B,N]
+            idx = torch.arange(N, device=dev, dtype=torch.int64)[None, :]  # [1,N]
             h1 = q.sum(dim=1)                      # [B]
             h2 = (q * idx).sum(dim=1)              # [B]
             seed_b = (self.base_seed
@@ -168,12 +174,12 @@ class PoissonEncoder:
             seed_b = seed_b.to(torch.int64)
 
             t = torch.arange(T, device=dev, dtype=torch.int64)[:, None, None]   # [T,1,1]
-            n = torch.arange(784, device=dev, dtype=torch.int64)[None, None, :] # [1,1,784]
+            n = torch.arange(N, device=dev, dtype=torch.int64)[None, None, :]   # [1,1,N]
             b = seed_b[None, :, None]                                           # [1,B,1]
 
             xmix = (b + t * 2246822519 + n * 3266489917) & 0xFFFFFFFF
             h = self._hash_u32(xmix)  # [T,B,784]
             rand = h.to(torch.float32) / 4294967296.0
 
-        spikes = (rand < p[None, :, :]).to(torch.float32)  # [T,B,784]
-        return _format_output(spikes, had_batch=had_batch, out_format=self.out_format)
+        spikes = (rand < p[None, :, :]).to(torch.float32)  # [T,B,N]
+        return _format_output(spikes, had_batch=had_batch, out_format=self.out_format, C=C, H=H, W=W)

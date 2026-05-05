@@ -2,7 +2,6 @@
 from __future__ import annotations
 import torch
 from bindsnet.network.monitors import Monitor
-from bindsnet.datasets import MNIST
 from torchvision import transforms
 
 from snn_mnist_net import SNNMeter
@@ -13,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from counts_readout import collect_counts_plus_fast, make_mnist_datasets
+from counts_readout import collect_counts_plus_fast, make_vision_datasets, make_mnist_datasets
 from readout_models import tfidf_from_counts, train_mlp_readout
 
 __all__ = ["probe_readouts_counts", "diehl_vote_accuracy"]
@@ -237,7 +236,8 @@ def diehl_vote_accuracy(
             if active_t.any():
                 winners = s_mask[active_t].argmax(dim=1)
                 cls = lm[winners]
-                votes = torch.bincount(cls, minlength=10)
+                K = int(max(10, int(lm_t.max().item()) + 1)) if torch.is_tensor(lm_t) and lm_t.numel() > 0 else 10
+                votes = torch.bincount(cls, minlength=K)
                 pred = int(votes.argmax().item())
             else:
                 pred = -1
@@ -263,14 +263,25 @@ def diehl_vote_accuracy(
     }
 
 @torch.no_grad()
-def evaluate_on_mnist(net, input_layer, lif_layer, encoder, label_map, T: int = 200, top_k: int = 3, n_test: int = 1000, seed: int = 999):
+def evaluate_on_mnist(
+    net,
+    input_layer,
+    lif_layer,
+    encoder,
+    label_map,
+    T: int = 200,
+    top_k: int = 3,
+    n_test: int = 1000,
+    seed: int = 999,
+    dataset: str = "mnist",
+):
     for c in net.connections.values():
         if hasattr(c, "update_rule"):
             c.update_rule.nu = (torch.as_tensor(0.0), torch.as_tensor(0.0))
 
     lif_mon = Monitor(lif_layer, state_vars=("s",), time=T); net.add_monitor(lif_mon, name="lif_test_tmp")
     transform = transforms.Compose([transforms.ToTensor()])
-    ds_test = MNIST(root="./data", train=False, download=True, transform=transform)
+    _ds_train, ds_test = make_vision_datasets(dataset=dataset, root="./data", transform=transform)
     idxs = list(range(min(n_test, len(ds_test))))
 
     correct = 0
@@ -295,7 +306,8 @@ def evaluate_on_mnist(net, input_layer, lif_layer, encoder, label_map, T: int = 
             if active_t.any():
                 winners_t = s2m[active_t].argmax(dim=1)
                 class_seq = lm_t[winners_t].clamp_min(0)
-                votes = torch.bincount(class_seq, minlength=10)
+                K = int(max(10, int(lm_t.max().item()) + 1)) if torch.is_tensor(lm_t) and lm_t.numel() > 0 else 10
+                votes = torch.bincount(class_seq, minlength=K)
                 pred = int(votes.argmax().item())
             else:
                 pred = -1
@@ -329,7 +341,13 @@ def _train_linear_readout(
     """
     dev = torch.device(device)
     in_dim = int(Xtr.shape[1])
-    head = nn.Linear(in_dim, 10).to(dev)
+    # Infer number of classes from labels (supports CIFAR100:20 etc.).
+    try:
+        n_classes = int(max(int(ytr.max().item()), int(yte.max().item())) + 1)
+    except Exception:
+        n_classes = 10
+    n_classes = max(2, n_classes)
+    head = nn.Linear(in_dim, n_classes).to(dev)
     opt = torch.optim.SGD(head.parameters(), lr=lr, weight_decay=weight_decay)
     crit = nn.CrossEntropyLoss()
 
@@ -486,7 +504,7 @@ def eval_readouts_from_net(
     Собирает counts(+WTA-hist) через counts_readout.collect_counts_plus,
     затем гоняет probe_readouts_counts над counts и возвращает метрики.
     """
-    ds_train, ds_test = make_mnist_datasets()
+    ds_train, ds_test = make_vision_datasets(dataset=str(getattr(cfg, "dataset", "mnist")))
     spikes_transform = None
     is_conv = False
     try:
@@ -499,7 +517,18 @@ def eval_readouts_from_net(
         # Force conv input [T,B,1,28,28] regardless of encoder output.
         from csnn_mnist_net import _spikes_flat_to_hw
         dev = cfg.torch_device() if hasattr(cfg, "torch_device") else None
-        spikes_transform = (lambda sp: _spikes_flat_to_hw(sp, dev or (sp.device if hasattr(sp,'device') else "cpu")))
+        C = int(getattr(cfg, "input_channels", 1))
+        H = int(getattr(cfg, "input_h", 28))
+        W = int(getattr(cfg, "input_w", 28))
+        def _tx(sp):
+            # If already [T,B,C,H,W], keep as-is.
+            try:
+                if hasattr(sp, "dim") and sp.dim() == 5:
+                    return sp
+            except Exception:
+                pass
+            return _spikes_flat_to_hw(sp, dev or (sp.device if hasattr(sp,'device') else "cpu"), C=C, H=H, W=W)
+        spikes_transform = _tx
 
     if label_map is None:
         # No label_map: disable WTA-hist features.

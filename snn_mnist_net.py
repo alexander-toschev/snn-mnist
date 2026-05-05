@@ -42,6 +42,7 @@ class Cfg:
     time: int = 200
     n_hidden: int = 100
     N: int = 200
+    dataset: str = "mnist"  # mnist | fashion | kmnist | emnist[:split]
     seed: int = 42
     device: str = "cpu"
     log_every: int = 50
@@ -59,6 +60,18 @@ class Cfg:
     poisson_deterministic: bool = False
     encoder_out_format: str = "auto"
     encoder_rate_boost: float = 3.0
+
+    # Online homeostasis (keep spikes/sample within a corridor by adjusting Poisson rate scale)
+    homeo_enable: bool = False
+    homeo_spikes_lo: float = 3000.0
+    homeo_spikes_hi: float = 5000.0
+    homeo_spikes_target: float = 4000.0
+    homeo_ema_alpha: float = 0.01
+    homeo_update_every: int = 25
+    homeo_warmup: int = 200
+    homeo_gain: float = 0.25
+    homeo_rate_mul_min: float = 0.3
+    homeo_rate_mul_max: float = 3.0
 
     thresh_init: float = 0.38
     thresh_min: float = 0.15
@@ -475,10 +488,10 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
     print("Используем:", device)
     _print_banner(cfg)
 
-    from bindsnet.datasets import MNIST
+    from datasets_vision import make_vision_datasets
 
     transform = transforms.Compose([transforms.ToTensor()])
-    ds = MNIST(root="./data", train=True, download=True, transform=transform)
+    ds, _ds_test = make_vision_datasets(dataset=str(getattr(cfg, "dataset", "mnist")), root="./data", transform=transform)
     n_train = min(cfg.N, len(ds))
 
     net, input_layer, lif_layer, connection, recurrent_inh, W_inh = build_net(cfg)

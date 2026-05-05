@@ -43,7 +43,8 @@
 #     )
 #
 # Возвращает:
-# - (X, y) или (X, y, debug_info), где X.shape = [n_samples, n_hidden + 10].
+# - (X, y) или (X, y, debug_info), где X.shape = [n_samples, n_hidden + K],
+#   K = number of classes (default 10; can be 20 for cifar100:20, etc.).
 
 
 # counts_readout.py
@@ -53,11 +54,16 @@ from typing import Tuple, Optional
 import torch
 from torch import Tensor
 from torchvision import transforms
-from bindsnet.datasets import MNIST
+from datasets_vision import make_vision_datasets
 from bindsnet.network.monitors import Monitor
 from tqdm import tqdm
 
-__all__ = ["collect_counts_plus", "make_mnist_datasets", "zscore_normalize"]
+__all__ = [
+    "collect_counts_plus",
+    "make_mnist_datasets",
+    "make_vision_datasets",
+    "zscore_normalize",
+]
 
 
 
@@ -123,7 +129,13 @@ def collect_counts_plus_cuda(
     N = lif_layer.n
 
     # Фичи/лейблы собираем на GPU, чтобы не гонять тензоры туда-сюда каждый шаг
-    X = torch.empty((n_samples, N + 10), device=device, dtype=torch.float32)
+    # Feature vector = counts (N) + WTA histogram (K classes).
+    # Infer K from label_map; default to 10 for MNIST-like datasets.
+    try:
+        K = int(max(10, int(label_map.max().item()) + 1)) if torch.is_tensor(label_map) and label_map.numel() > 0 else 10
+    except Exception:
+        K = 10
+    X = torch.empty((n_samples, N + K), device=device, dtype=torch.float32)
     y = torch.empty((n_samples,), device=device, dtype=torch.long)
 
     # label_map на GPU
@@ -234,12 +246,15 @@ def collect_counts_plus_cuda(
             cls_idx = lm[winners_t]                    # [K]
             cls_idx = cls_idx[cls_idx >= 0]
             if cls_idx.numel() > 0:
-                hist = torch.bincount(cls_idx, minlength=10).to(torch.float32)
+                K = int(max(10, int(lm.max().item()) + 1)) if torch.is_tensor(lm) and lm.numel() > 0 else 10
+                hist = torch.bincount(cls_idx, minlength=K).to(torch.float32)
                 hist = hist / active_t.sum().to(torch.float32)
             else:
-                hist = torch.zeros(10, dtype=torch.float32, device=device)
+                K = int(max(10, int(lm.max().item()) + 1)) if torch.is_tensor(lm) and lm.numel() > 0 else 10
+                hist = torch.zeros(K, dtype=torch.float32, device=device)
         else:
-            hist = torch.zeros(10, dtype=torch.float32, device=device)
+            K = int(max(10, int(lm.max().item()) + 1)) if torch.is_tensor(lm) and lm.numel() > 0 else 10
+            hist = torch.zeros(K, dtype=torch.float32, device=device)
 
         X[i] = torch.cat([counts, hist], dim=0)
         y[i] = y_i
@@ -308,11 +323,8 @@ def collect_counts_plus_cuda(
 
 
 def make_mnist_datasets(transform: Optional[transforms.Compose] = None):
-    if transform is None:
-        transform = transforms.Compose([transforms.ToTensor()])
-    ds_train = MNIST(root="./data", train=True, download=True, transform=transform)
-    ds_test  = MNIST(root="./data", train=False, download=True, transform=transform)
-    return ds_train, ds_test
+    """Backward-compatible wrapper."""
+    return make_vision_datasets(dataset="mnist", root="./data", transform=transform)
 
 @torch.no_grad()
 def zscore_normalize(Xtr: Tensor, Xte: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -380,6 +392,15 @@ def collect_counts_plus_fast(
         rand = torch.rand((T, B, lam.shape[1]), device=dev)
         return (rand < p).float()  # [T,B,784]
 
+    # 0) cap n_samples to dataset length (prevents DataLoader indexing past the dataset)
+    # This matters for vision datasets like CIFAR where train/test sizes differ from MNIST defaults.
+    try:
+        ds_len = int(len(ds))
+        if ds_len >= 0 and int(n_samples) > ds_len:
+            n_samples = ds_len
+    except Exception:
+        pass
+
     # 0) девайс
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -416,6 +437,16 @@ def collect_counts_plus_fast(
     net.add_monitor(mon, name="lif_tmp_counts_plus_fast")
 
     N = lif_layer.n
+    # Feature vector size depends on number of classes in label_map.
+    # Default to 10 (MNIST-like). For CIFAR100:20 etc, label_map contains labels 0..K-1.
+    try:
+        _lm_cpu = torch.as_tensor(label_map, dtype=torch.long)
+        if _lm_cpu.numel() > 0:
+            K = int(max(10, int(_lm_cpu.max().item()) + 1))
+        else:
+            K = 10
+    except Exception:
+        K = 10
     # For large conv hidden layers, X can be huge (n_samples*(N+10)).
     # Allow streaming to a disk-backed memmap to avoid OOM.
     use_memmap = False
@@ -430,11 +461,11 @@ def collect_counts_plus_fast(
         mm_path = getattr(net, "_memmap_path", None)
         if mm_path is None:
             raise ValueError("use_memmap requested but net._memmap_path is None")
-        X = np.memmap(str(mm_path), mode="w+", dtype=np.float32, shape=(n_samples, N + 10))
+        X = np.memmap(str(mm_path), mode="w+", dtype=np.float32, shape=(n_samples, N + K))
         y_path = str(mm_path) + ".y.memmap"
         y = np.memmap(y_path, mode="w+", dtype=np.int64, shape=(n_samples,))
     else:
-        X = torch.empty((n_samples, N + 10), device=output_device, dtype=torch.float32)
+        X = torch.empty((n_samples, N + K), device=output_device, dtype=torch.float32)
         y = torch.empty((n_samples,), device=output_device, dtype=torch.long)
 
     # label_map и пороги
@@ -635,16 +666,19 @@ def collect_counts_plus_fast(
 
         active_counts_b = active_tb.sum(0).to(torch.float32)  # [B]
         b_ids = torch.arange(B, device=device)[None, :].expand(T, B)
-        flat_idx = (b_ids * 10 + cls_tb.clamp(min=0)).reshape(-1)
+        # WTA histogram size depends on number of classes.
+        # `lm` may contain labels in [0..K-1] (or -1 for unassigned neurons).
+        K = int(max(10, int(lm.max().item()) + 1)) if torch.is_tensor(lm) and lm.numel() > 0 else 10
+        flat_idx = (b_ids * K + cls_tb.clamp(min=0)).reshape(-1)
         w = valid_tb.to(torch.float32).reshape(-1)
 
-        hist_flat = torch.bincount(flat_idx, weights=w, minlength=B * 10).to(torch.float32)
-        hist_b10 = hist_flat.view(B, 10)
+        hist_flat = torch.bincount(flat_idx, weights=w, minlength=B * K).to(torch.float32)
+        hist_bk = hist_flat.view(B, K)
 
         denom = active_counts_b.clamp(min=1.0).unsqueeze(1)
-        hist_b10 = hist_b10 / denom
+        hist_bk = hist_bk / denom
 
-        feats = torch.cat([counts_bn, hist_b10], dim=1)               # [B, N+10]
+        feats = torch.cat([counts_bn, hist_bk], dim=1)               # [B, N+K]
 
         # F) запись
         if use_memmap:
@@ -728,4 +762,3 @@ def collect_counts_plus_fast(
     assert write_pos == n_samples, f"collected {write_pos}, expected {n_samples}"
 
     return (X, y, debug_info) if return_debug else (X, y)
-

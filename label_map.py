@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Optional 
 import torch
 from bindsnet.network.monitors import Monitor
-from bindsnet.datasets import MNIST
 from torchvision import transforms
 import os, time
+
+from datasets_vision import make_vision_datasets
 
 
 # добавь в список экспорта:
@@ -39,7 +40,17 @@ def load_label_map(path: str, device: Optional[str] = None) -> torch.Tensor:
     return lm
 
 @torch.no_grad()
-def build_label_map(net, input_layer, lif_layer, encoder, n_calib: int = 2000, T: int = 200, top_k: int = 3, seed: int = 123) -> torch.Tensor:
+def build_label_map(
+    net,
+    input_layer,
+    lif_layer,
+    encoder,
+    n_calib: int = 2000,
+    T: int = 200,
+    top_k: int = 3,
+    seed: int = 123,
+    dataset: str = "mnist",
+) -> torch.Tensor:
     for c in net.connections.values():
         if hasattr(c, "update_rule"):
             c.update_rule.nu = (torch.as_tensor(0.0), torch.as_tensor(0.0))
@@ -47,11 +58,21 @@ def build_label_map(net, input_layer, lif_layer, encoder, n_calib: int = 2000, T
     lif_mon = Monitor(lif_layer, state_vars=("s",), time=T); net.add_monitor(lif_mon, name="lif_eval_tmp")
 
     transform = transforms.Compose([transforms.ToTensor()])
-    ds_train = MNIST(root="./data", train=True, download=True, transform=transform)
+    ds_train, _ds_test = make_vision_datasets(dataset=dataset, root="./data", transform=transform)
     idxs = list(range(min(n_calib, len(ds_train))))
 
     usage = torch.zeros((lif_layer.n,), dtype=torch.long)
-    wins  = torch.zeros((lif_layer.n, 10), dtype=torch.long)
+    # Number of classes: infer from dataset labels in the calibration subset.
+    # Default to 10 for MNIST-like datasets.
+    try:
+        y_max = 0
+        for i in idxs[: min(len(idxs), 2000)]:
+            y_max = max(y_max, int(ds_train[i]["label"]))
+        n_classes = int(y_max) + 1
+    except Exception:
+        n_classes = 10
+    n_classes = max(2, n_classes)
+    wins  = torch.zeros((lif_layer.n, n_classes), dtype=torch.long)
 
     # Ensure inputs are on the same device as the network runtime.
     # BindsNet will error if self.x and mask self.s are on different devices.
