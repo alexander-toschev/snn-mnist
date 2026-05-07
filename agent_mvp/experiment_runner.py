@@ -151,7 +151,22 @@ def run_single_experiment(
             # Ensure the conv input adapter is available even if label_map is skipped.
             from csnn_mnist_net import _spikes_flat_to_hw
 
-            transform = transforms.Compose([transforms.ToTensor()])
+            # Input transform
+            # CIFAR returns PIL images; transforms are applied before ToTensor.
+            mode = str(getattr(cfg, "input_mode", "rgb") or "rgb").lower()
+            if mode in {"gray1", "grayscale1", "mono"}:
+                transform = transforms.Compose([
+                    transforms.Grayscale(num_output_channels=1),
+                    transforms.ToTensor(),
+                ])
+            elif mode in {"gray3", "grayscale3"}:
+                # Grayscale but keep 3 channels (replicated) to preserve Conv weight shapes.
+                transform = transforms.Compose([
+                    transforms.Grayscale(num_output_channels=3),
+                    transforms.ToTensor(),
+                ])
+            else:
+                transform = transforms.Compose([transforms.ToTensor()])
             ds_train, _ds_test = make_vision_datasets(dataset=str(getattr(cfg, "dataset", "mnist")), root="./data", transform=transform)
             ds = ds_train
             n_train = min(int(getattr(cfg, "N", 12000)), len(ds))

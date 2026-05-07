@@ -44,6 +44,12 @@ class CSCfg:
     input_h: int = 28
     input_w: int = 28
 
+    # input preprocessing mode (handled in agent_mvp/experiment_runner.py for torchvision datasets)
+    # - "rgb"   : keep 3-channel input (default for CIFAR)
+    # - "gray1" : convert to 1 channel
+    # - "gray3" : convert to grayscale and replicate to 3 channels (keeps Conv shapes)
+    input_mode: str = "rgb"
+
     # input encoding
     encoder: str = "poisson"
     poisson_rate_scale: float = 0.011

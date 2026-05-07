@@ -252,6 +252,9 @@
 ## 2026-05-07 — resume+eval (from stalled label_map run)
 - resume_from: 20260506T113211Z_8c12de619250 (model_after_train.pt)
 - eval run: 20260507T083853Z_f89312662a47 → acc=**0.192** (counts_zscore+Linear), assigned=558/16384
+## 2026-05-07 — A/B: grayscale input (gray3) vs RGB baseline
+- cfg: input_mode=gray3 (grayscale replicated to 3 channels), rate_scale=0.007, local_inhib=0.85, time=100, N=5000
+- run_id: 20260507T094851Z_869414e168b6 → acc=**0.204** (counts_zscore+Linear), spikes/sample=41288.75, assigned=662/16384
 
 
 ## ЕДИНЫЙ ЖУРНАЛ
