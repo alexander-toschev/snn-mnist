@@ -504,7 +504,25 @@ def eval_readouts_from_net(
     Собирает counts(+WTA-hist) через counts_readout.collect_counts_plus,
     затем гоняет probe_readouts_counts над counts и возвращает метрики.
     """
-    ds_train, ds_test = make_vision_datasets(dataset=str(getattr(cfg, "dataset", "mnist")))
+    # Match dataset transform to training input_mode (for CIFAR etc.)
+    try:
+        from torchvision import transforms as _tv
+        mode = str(getattr(cfg, "input_mode", "rgb") or "rgb").lower()
+        if mode in {"gray1", "grayscale1", "mono"}:
+            transform = _tv.Compose([_tv.Grayscale(num_output_channels=1), _tv.ToTensor()])
+        elif mode in {"gray3", "grayscale3"}:
+            transform = _tv.Compose([_tv.Grayscale(num_output_channels=3), _tv.ToTensor()])
+        else:
+            transform = _tv.Compose([_tv.ToTensor()])
+    except Exception:
+        transform = None
+
+    ds_train, ds_test = make_vision_datasets(
+        dataset=str(getattr(cfg, "dataset", "mnist")),
+        root="./data",
+        transform=transform,
+        download=False,
+    )
     spikes_transform = None
     is_conv = False
     try:

@@ -256,6 +256,10 @@
 - cfg: input_mode=gray3 (grayscale replicated to 3 channels), rate_scale=0.007, local_inhib=0.85, time=100, N=5000
 - run_id: 20260507T094851Z_869414e168b6 → acc=**0.204** (counts_zscore+Linear), spikes/sample=41288.75, assigned=662/16384
 
+⚠️ NOTE: этот acc=0.204 был посчитан с несостыкованным препроцессингом (train=gray3, но label_map/eval по умолчанию были RGB).
+После фикса (label_map/eval тоже используют input_mode) корректный resume+eval:
+- run_id: 20260507T111553Z_bd63b25d2002 → acc=**0.177** (counts_zscore+Linear), assigned=569/16384
+
 
 ## ЕДИНЫЙ ЖУРНАЛ
 Дополнительная сводка/хронология по всем датасетам ведётся в: `EXPERIMENTS-HISTORY.md`.

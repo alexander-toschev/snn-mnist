@@ -683,6 +683,7 @@ def run_single_experiment(
                     top_k=max(1, int(getattr(cfg, "top_k", 0)) if int(getattr(cfg, "top_k", 0)) > 0 else 3),
                     seed=cfg.seed,
                     dataset=str(getattr(cfg, "dataset", "mnist")),
+                    transform=transform,
                 )
             else:
                 label_map = build_label_map(
@@ -695,6 +696,7 @@ def run_single_experiment(
                     top_k=max(1, int(cfg.top_k) if int(cfg.top_k) > 0 else 3),
                     seed=cfg.seed,
                     dataset=str(getattr(cfg, "dataset", "mnist")),
+                    transform=transform,
                 )
             label_map_path = run_dir / "label_map.pt"
             save_label_map(

@@ -50,6 +50,7 @@ def build_label_map(
     top_k: int = 3,
     seed: int = 123,
     dataset: str = "mnist",
+    transform=None,
 ) -> torch.Tensor:
     for c in net.connections.values():
         if hasattr(c, "update_rule"):
@@ -57,7 +58,8 @@ def build_label_map(
 
     lif_mon = Monitor(lif_layer, state_vars=("s",), time=T); net.add_monitor(lif_mon, name="lif_eval_tmp")
 
-    transform = transforms.Compose([transforms.ToTensor()])
+    if transform is None:
+        transform = transforms.Compose([transforms.ToTensor()])
     ds_train, _ds_test = make_vision_datasets(dataset=dataset, root="./data", transform=transform)
     idxs = list(range(min(n_calib, len(ds_train))))
 
