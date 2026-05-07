@@ -216,6 +216,16 @@ def run_single_experiment(
             act_win_min = None
             act_win_max = None
 
+            # Winner stats for last layer (argmax over per-neuron spike counts per sample)
+            winner_counts_total = None
+            winner_counts_win = None
+            try:
+                winner_counts_total = torch.zeros((int(lif_layer.n),), dtype=torch.long)
+                winner_counts_win = torch.zeros_like(winner_counts_total)
+            except Exception:
+                winner_counts_total = None
+                winner_counts_win = None
+
             # Per-layer windowed stats (only when mon_layers enabled)
             act_layers_sum = {k: 0 for k in mon_layers}
             act_layers_min = {k: None for k in mon_layers}
@@ -296,6 +306,22 @@ def run_single_experiment(
                     sH = mon_H.get("s")  # expected [T,B,C,H,W]
                     if torch.is_tensor(sH):
                         ssum = int(sH.sum().item())
+
+                        # Track per-sample winner (top-1 neuron by total spikes over time).
+                        try:
+                            if winner_counts_total is not None:
+                                if sH.dim() == 5:
+                                    counts = sH[:, 0, :, :, :].reshape(sH.shape[0], -1).sum(0)
+                                else:
+                                    counts = sH[:, 0, :].sum(0)
+                                if torch.is_tensor(counts) and int(counts.sum().item()) > 0:
+                                    widx = int(counts.argmax().item())
+                                    winner_counts_total[widx] += 1
+                                    if winner_counts_win is not None:
+                                        winner_counts_win[widx] += 1
+                        except Exception:
+                            pass
+
                         mon_H.reset_state_variables()
                 except Exception:
                     ssum = None
@@ -406,6 +432,22 @@ def run_single_experiment(
                             theta_mean = float(theta.mean().item())
                         win_mean = (float(act_win_sum) / max(1, act_win_n))
 
+                        # Windowed winner stats (top-1 winner per sample)
+                        win_unique = None
+                        win_hhi = None
+                        try:
+                            if winner_counts_win is not None:
+                                tot = int(winner_counts_win.sum().item())
+                                win_unique = int((winner_counts_win > 0).sum().item())
+                                if tot > 0:
+                                    p = winner_counts_win.float() / float(tot)
+                                    win_hhi = float((p * p).sum().item())
+                                else:
+                                    win_hhi = 0.0
+                        except Exception:
+                            win_unique = None
+                            win_hhi = None
+
                         layers_rec = None
                         if act_layers_sum and act_win_n > 0:
                             try:
@@ -426,6 +468,8 @@ def run_single_experiment(
                             "spikes_win_mean": float(win_mean),
                             "spikes_win_min": int(act_win_min) if act_win_min is not None else None,
                             "spikes_win_max": int(act_win_max) if act_win_max is not None else None,
+                            "winners_unique_win": win_unique,
+                            "winner_HHI_win": win_hhi,
                             "theta_mean": theta_mean,
                             "t": utc_now_iso(),
                             **rec_extra,
@@ -443,6 +487,8 @@ def run_single_experiment(
                             activity_spikes_win_min=(int(act_win_min) if act_win_min is not None else None),
                             activity_spikes_win_max=(int(act_win_max) if act_win_max is not None else None),
                             activity_theta_mean=theta_mean,
+                            activity_winners_unique=(int(win_unique) if win_unique is not None else None),
+                            activity_winner_HHI=(float(win_hhi) if win_hhi is not None else None),
                             activity_homeo_rate_scale=(float(homeo_info.get("homeo_rate_scale")) if homeo_info else None),
                             activity_homeo_ema_spikes=(float(homeo_info.get("homeo_ema_spikes")) if homeo_info else None),
                             activity_homeo_rate_mul=(float(homeo_info.get("homeo_rate_mul")) if homeo_info else None),
@@ -454,6 +500,9 @@ def run_single_experiment(
                         act_win_n = 0
                         act_win_min = None
                         act_win_max = None
+
+                        if winner_counts_win is not None:
+                            winner_counts_win.zero_()
 
                         # Reset per-layer windows.
                         if act_layers_sum:
@@ -537,9 +586,19 @@ def run_single_experiment(
                 "encoder": str(cfg.encoder),
                 "spikes_per_sample": spikes_per_sample,
                 "energy_proxy_per_sample": spikes_per_sample,
-                "winners_unique": None,
+                "winners_unique": (int((winner_counts_total > 0).sum().item()) if winner_counts_total is not None else None),
                 "winner_HHI": None,
             }
+            try:
+                if winner_counts_total is not None:
+                    tot = int(winner_counts_total.sum().item())
+                    if tot > 0:
+                        p = winner_counts_total.float() / float(tot)
+                        train_summary["winner_HHI"] = float((p * p).sum().item())
+                    else:
+                        train_summary["winner_HHI"] = 0.0
+            except Exception:
+                pass
         else:
             train_summary, connection, lif_layer, net, encoder = run_experiment(
                 cfg, verbose=verbose, progress=progress

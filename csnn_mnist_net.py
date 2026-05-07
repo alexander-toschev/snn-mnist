@@ -101,6 +101,11 @@ class CSCfg:
     rest_val: float = 0.0
     thresh_init: float = 0.38
 
+    # Per-layer threshold multipliers (useful to tame deep-layer activity)
+    thresh_mult_c1: float = 1.0
+    thresh_mult_c2: float = 1.0
+    thresh_mult_c3: float = 1.0
+
     # STDP
     nu_plus: float = 1e-4
     nu_minus: float = -1e-3
@@ -131,6 +136,8 @@ class CSCfg:
     # Temporal sparsity: allow each neuron to spike at most once per sample
     # (approximate first-spike / time-to-first-spike behavior for rate encoders).
     first_spike_only: bool = False
+    # Apply first-spike-only only to the last conv layer (e.g., Conv3) instead of all layers.
+    first_spike_only_last_layer: bool = False
 
     # misc (keep parity with FC pipeline overrides)
     log_every: int = 50
@@ -357,7 +364,18 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                         if not hasattr(lif, "theta"):
                             lif.theta = None
                         if not hasattr(lif, "thresh_base"):
-                            lif.thresh_base = torch.as_tensor(float(cfg.thresh_init), device=device)
+                            # Allow per-layer scaling to avoid deep-layer spike avalanches.
+                            mult = 1.0
+                            try:
+                                if li == 0:
+                                    mult = float(getattr(cfg, "thresh_mult_c1", 1.0))
+                                elif li == 1:
+                                    mult = float(getattr(cfg, "thresh_mult_c2", 1.0))
+                                elif li == 2:
+                                    mult = float(getattr(cfg, "thresh_mult_c3", 1.0))
+                            except Exception:
+                                mult = 1.0
+                            lif.thresh_base = torch.as_tensor(float(cfg.thresh_init) * mult, device=device)
                         if not hasattr(lif, "thresh"):
                             lif.thresh = lif.thresh_base
 
@@ -440,12 +458,18 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                 x = inputs["Input"]
 
                 # Optional first-spike-only mode (per sample): once a neuron has spiked, keep it
-                # refractory for the rest of the sample. Helps reduce spike avalanches in deep layers.
-                fs_only = bool(getattr(cfg, "first_spike_only", False))
+                # refractory for the rest of the sample.
+                # - first_spike_only: apply to all conv layers
+                # - first_spike_only_last_layer: apply only to the last conv layer
+                fs_only_all = bool(getattr(cfg, "first_spike_only", False))
+                fs_only_last = (not fs_only_all) and bool(getattr(cfg, "first_spike_only_last_layer", False))
+                fs_only = fs_only_all or fs_only_last
                 fired = None
                 if fs_only:
                     try:
                         lifs0 = list(getattr(net, "_csnn_lifs", [])) or [conv_lif]
+                        if fs_only_last and lifs0:
+                            lifs0 = [lifs0[-1]]
                         fired = {}
                         for lif in lifs0:
                             s0 = getattr(lif, "s", None)
@@ -463,6 +487,8 @@ def build_csnn(cfg: CSCfg) -> Tuple[Network, Input, LIFNodes, Connection]:
                     if fs_only and fired:
                         try:
                             lifs1 = list(getattr(net, "_csnn_lifs", [])) or [conv_lif]
+                            if fs_only_last and lifs1:
+                                lifs1 = [lifs1[-1]]
                             for lif in lifs1:
                                 s = getattr(lif, "s", None)
                                 if not (torch.is_tensor(s) and s.ndim == 4):

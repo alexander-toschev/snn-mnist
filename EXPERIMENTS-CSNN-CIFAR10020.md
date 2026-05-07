@@ -225,5 +225,54 @@
   - spikes/sample=**58709.68**
   - assigned=**164/8192**
 
+## 2026-05-06 — eval-only resume (3-layer greedy + local_inhib + homeo, top_k=20)
+- исходный train run: 20260505T183309Z_60a47286351e
+- eval run: 20260506T052927Z_ea635b5e466f
+  - budgets: n_calib=1000, n_train_counts=60000, n_test_counts=10000
+  - best_acc=**0.137** (counts_zscore+Linear)
+  - assigned=**1006/8192**
+
+## 2026-05-06 — 2-layer greedy + local_inhib (no WTA, no EI, no homeo)
+- run_id: 20260506T082140Z_7c1ea8971373 (finished 2026-05-06T09:11:07Z)
+  - cfg: greedy=1 (n1=2500) local_inhib=1 (strength=0.85) wta=0 | rate_scale=0.008 | time=100 | adapt_thresh=1 | w_norm=1 (target=12.5)
+  - best_acc=**0.1955** (counts_zscore+Linear)
+  - spikes/sample=**44626.86**
+  - assigned=**639/16384**
+
+## 2026-05-06 — sweep: local_inhib_strength (rate_scale=0.008, time=100)
+- 0.75 → 20260506T094835Z_f5c04bfe1fc9 → acc=**0.1955**, spikes/sample=44630.41, assigned=641/16384
+- 0.85 → 20260506T104118Z_7c1ea8971373 → acc=**0.1955**, spikes/sample=44630.19, assigned=640/16384
+- 0.95 → (resume+eval) 20260506T130605Z_f89312662a47 → acc=**0.176**, assigned=557/16384
+
+## 2026-05-06 — sweep: poisson_rate_scale (local_inhib=0.85, time=100)
+- 0.007 → 20260506T132044Z_956ee7406f0b → acc=**0.1965**, spikes/sample=40774.61, assigned=637/16384
+- 0.008 → 20260506T141148Z_7c1ea8971373 → acc=**0.1935**, spikes/sample=44615.37, assigned=639/16384
+- 0.009 → 20260506T150224Z_4baccc9ea0a5 → acc=**0.1895**, spikes/sample=48247.92, assigned=641/16384
+
+## 2026-05-07 — resume+eval (from stalled label_map run)
+- resume_from: 20260506T113211Z_8c12de619250 (model_after_train.pt)
+- eval run: 20260507T083853Z_f89312662a47 → acc=**0.192** (counts_zscore+Linear), assigned=558/16384
+
+
 ## ЕДИНЫЙ ЖУРНАЛ
 Дополнительная сводка/хронология по всем датасетам ведётся в: `EXPERIMENTS-HISTORY.md`.
+
+
+---
+### 20260502T200107Z_9c06d933fe14 (finished_at: 2026-05-02T21:21:48Z)
+- wta=1 ei=1 ei_inh=120.0 ei_inh_mult_2layer=0.01
+- spikes_per_sample=43345.9618
+- assigned=686
+- best_acc=0.186
+- error=None
+
+---
+### CSNN run 20260502T181648Z_fdebdc16466c — OK (EI fixed, retry)
+- dataset: cifar100:20 | device: cuda | arch: csnn
+- created_at: 2026-05-02T18:16:48Z | finished_at: 2026-05-02T19:29:11Z
+- flags: greedy=on (n1=2500); wta=off; ei=on (inh=120.0, inh_mult_2layer=0.01); adapt_thresh=on; w_norm=on (target=12.5); homeo=off
+- encoder: poisson (deterministic, rate_scale=0.008, rate_boost=1.0) | time=100 | N=5000
+- best_acc=**0.1875** (counts_zscore+Linear)
+- assigned=**686/16384** | spikes/sample=**43332.19**
+- error: None
+- 2026-05-06 19:55 UTC run_id=20260502T095644Z_221089919b62 N=5000 → ok, best_acc=0.05
