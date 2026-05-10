@@ -46,7 +46,9 @@ def _parse_dataset_name(name: str) -> Tuple[str, Optional[str]]:
       - fashion / fashion-mnist
       - kmnist
       - emnist[:split]  (default split=balanced)
-      - cifar100[:K]    (optional K=int → keep only labels 0..K-1)
+      - cifar100[:K]              (optional K=int → keep only labels 0..K-1)
+      - cifar100:lbl0,lbl1,...    (optional list → keep only those fine labels, remapped to 0..K-1)
+      - cifar100:labels=lbl0,...  (same as above)
     """
     n = (name or "mnist").strip().lower()
     if n.startswith("emnist"):
@@ -65,6 +67,28 @@ def _parse_dataset_name(name: str) -> Tuple[str, Optional[str]]:
             return "cifar100", k or None
         return "cifar100", None
     return n, None
+
+
+def _parse_int_list(s: str) -> Optional[list[int]]:
+    """Parse comma-separated ints (optionally wrapped) or return None."""
+    if s is None:
+        return None
+    t = str(s).strip()
+    if not t:
+        return None
+    if t.startswith("labels="):
+        t = t[len("labels="):].strip()
+    if t.startswith("[") and t.endswith("]"):
+        t = t[1:-1].strip()
+    if "," not in t:
+        return None
+    parts = [p.strip() for p in t.split(",") if p.strip()]
+    if not parts:
+        return None
+    for p in parts:
+        if not p.lstrip("-").isdigit():
+            return None
+    return [int(p) for p in parts]
 
 
 class FilterLabelsDataset(Dataset):
@@ -131,12 +155,19 @@ def make_vision_datasets(
     elif base == "cifar100":
         train = CIFAR100(root=root, train=True, download=download, transform=transform)
         test = CIFAR100(root=root, train=False, download=download, transform=transform)
-        # Optional subset: cifar100:K keeps only fine labels 0..K-1.
-        if split is not None and str(split).isdigit():
-            k = int(split)
-            keep = list(range(k))
-            train = FilterLabelsDataset(train, keep_labels=keep, remap=True)
-            test = FilterLabelsDataset(test, keep_labels=keep, remap=True)
+        # Optional subset:
+        #  - cifar100:K keeps only fine labels 0..K-1
+        #  - cifar100:0,1,2 keeps only those fine labels (remapped)
+        if split is not None:
+            split_s = str(split).strip()
+            keep: Optional[list[int]] = None
+            if split_s.isdigit():
+                keep = list(range(int(split_s)))
+            else:
+                keep = _parse_int_list(split_s)
+            if keep is not None:
+                train = FilterLabelsDataset(train, keep_labels=keep, remap=True)
+                test = FilterLabelsDataset(test, keep_labels=keep, remap=True)
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 

@@ -283,3 +283,77 @@
 - assigned=**686/16384** | spikes/sample=**43332.19**
 - error: None
 - 2026-05-06 19:55 UTC run_id=20260502T095644Z_221089919b62 N=5000 → ok, best_acc=0.05
+
+---
+### CSNN run 20260502T133156Z_9c06d933fe14 — FAILED (appended 2026-05-09T00:35:54Z)
+- dataset: cifar100:20 | device: cuda | arch: csnn
+- created_at: 2026-05-02T13:31:56Z | finished_at: 2026-05-02T13:42:44Z
+- flags: wta=on; ei=on; ei_exc=22.5; ei_inh=120.0; ei_inh_mult_2layer=0.01; greedy=on; n1=2500; adapt_thresh=on; w_norm=on; w_norm_target=12.5; homeo=off
+- encoder: poisson (deterministic=True, rate_scale=0.008, rate_boost=1.0) | time=100 | N=5000
+- progress: i=1000/5000 (20%)
+- error: RuntimeError: low activity: spikes_win_mean=27.380 < 1000.000 at i=1000 (in_spikes=945)
+
+
+---
+### Run 20260502T133156Z_9c06d933fe14 (2026-05-10 01:14:34 +0300)
+- **status:** failed
+- **created_at:** 2026-05-02T13:31:56Z
+- **finished_at:** 2026-05-02T13:42:44Z
+- **run_dir:** `runs_csnn/20260502T133156Z_9c06d933fe14`
+- **config_hash:** `9c06d933fe14`
+- **error:** low activity: spikes_win_mean=27.380 < 1000.000 at i=1000 (in_spikes=945)
+
+
+## Run 20260502T133156Z_9c06d933fe14
+- time: 2026-05-10T01:58:47+03:00
+- status: failed
+- error: low activity: spikes_win_mean=27.380 < 1000.000 at i=1000 (in_spikes=945)
+- flags: `{"N": 5000, "activity_check_after": 1000, "activity_min_spikes_win_mean": 1000.0, "adapt_thresh_enable": true, "arch": "csnn", "c1_kernel": 5, "c1_out": 32, "c1_pad": 2, "c1_stride": 1, "c2_kernel": 3, "c2_out": 64, "c2_pad": 1, "c2_stride": 2, "dataset": "cifar100:20", "device": "cuda", "ei_enable": true, "ei_exc": 22.5, "ei_inh": 120.0, "ei_inh_mult_2layer": 0.01, "encoder": "poisson", "encoder_rate_boost": 1.0, "greedy_enable": true, "greedy_n1": 2500, "homeo_enable": false, "input_channels": 3, "input_h": 32, "input_w": 32, "poisson_deterministic": true, "poisson_rate_scale": 0.008, "tau_theta": 10000, "theta_plus": 0.05, "time": 100, "w_norm_enable": true, "w_norm_target": 12.5, "wta_enable": true}`
+
+### 2026-05-02 16:05:28 UTC — 20260502T160528Z_fdebdc16466c
+- dataset: `cifar100:20`
+- flags: wta=False, ei=True, ei_inh_mult_2layer=0.01
+- status: **failed** (stage=stale)
+- progress: 63.5% (i=3175/5000)
+- error: `stale run: no running process found; last updated_at=2026-05-02T16:39:28Z`
+- updated_at: 2026-05-02T16:39:28Z
+- finished_at: 2026-05-02T18:15:52Z
+
+
+---
+## 2026-05-09 — Diverse10 (cifar100:0,1,2,3,5,8,13,14,17,19) — цель: поднять acc
+
+Все ниже: input_mode=rgb, local_inhib=0.85, greedy_n1=2500, EI=off, WTA=off, adapt_thresh=on, w_norm_target=12.5, N=5000.
+
+- 3-layer (c3_out=128), T=100, rate_scale=0.007 → run_id=20260509T085735Z_121c0577da30 → best_readout_acc=**0.297** | spikes/sample=53625 | assigned=175/8192
+- 3-layer (c3_out=128), T=200, rate_scale=0.007 → run_id=20260509T102615Z_b779aa59200d → best_readout_acc=**0.314** | spikes/sample=145046 | assigned=155/8192
+- 2-layer, T=300, rate_scale=0.007 → run_id=20260509T112827Z_a45fd48d8259 → best_readout_acc=**0.322** | spikes/sample=170008 | assigned=640/16384
+- 3-layer (c3_out=256), T=100, rate_scale=0.007 → run_id=20260509T125440Z_5c15461cec09 → best_readout_acc=**0.297** | spikes/sample=107253 | assigned=175/16384
+
+Компромиссы по spike-бюджету:
+- 2-layer, T=200, rate_scale=0.0035 → run_id=20260509T164028Z_a817e778353e → best_readout_acc=**0.313** | spikes/sample=63090 | assigned=641/16384
+- 2-layer, T=300, rate_scale=0.00233 → run_id=20260509T183647Z_8db3d1e00da6 → best_readout_acc=**0.310** | spikes/sample=76720 | assigned=632/16384
+
+Сбой:
+- run_id=20260509T144624Z_a817e778353e (T=200, rate_scale=0.0035) → завис/не дописал summary (остановился ~4.48%, i=224).
+
+Вывод: 2-layer даёт существенно более «богатое» распределение winner'ов и assigned, чем 3-layer, и выглядит лучшей базой для роста точности.
+
+
+---
+## 2026-05-10 — План: Diverse10 accuracy push (архитектура → N → readout)
+
+### Этап A (N=5000, T=200, rate_scale=0.0035): sweep ёмкости
+Запускаем 4 прогона (2-layer):
+1) baseline: c1_out=32, c2_out=64, greedy_n1=2500
+2) widen:   c1_out=64, c2_out=128, greedy_n1=2500
+3) neurons: c1_out=32, c2_out=64, greedy_n1=5000
+4) both:    c1_out=64, c2_out=128, greedy_n1=5000
+
+Критерий выбора: best_readout_acc (counts_zscore+Linear) + sanity по assigned/winners_unique.
+
+### Этап B (увеличить N на лучшей конфигурации)
+Повторить лучшую конфигурацию на N=20000 (и при необходимости выше).
+
+### Этап C (readout)
+На лучших чекпойнтах прогнать MLP readout и сравнить с Linear.

@@ -111,11 +111,17 @@ def train_mlp_readout(
     dev = torch.device(device)
 
     N = Xtr.shape[1]
+    # Infer number of classes from labels (supports CIFAR100:20 etc.)
+    try:
+        n_classes = int(max(int(ytr.max().item()), int(yte.max().item())) + 1)
+    except Exception:
+        n_classes = 10
+    n_classes = max(2, n_classes)
     model = nn.Sequential(
         nn.Linear(N, hidden),
         nn.ReLU(),
         nn.Dropout(dropout),
-        nn.Linear(hidden, 10),
+        nn.Linear(hidden, n_classes),
     ).to(dev)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
