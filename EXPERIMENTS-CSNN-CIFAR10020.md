@@ -312,7 +312,7 @@
 
 ### 2026-05-02 16:05:28 UTC — 20260502T160528Z_fdebdc16466c
 - dataset: `cifar100:20`
-- flags: wta=False, ei=True, ei_inh_mult_2layer=0.01
+- flags: wta=True, ei=True, ei_inh_mult_2layer=0.01
 - status: **failed** (stage=stale)
 - progress: 63.5% (i=3175/5000)
 - error: `stale run: no running process found; last updated_at=2026-05-02T16:39:28Z`
@@ -357,3 +357,45 @@
 
 ### Этап C (readout)
 На лучших чекпойнтах прогнать MLP readout и сравнить с Linear.
+
+### Результаты Этап A (N=5000)
+(общее: input_mode=rgb, local_inhib=0.85, EI=off, WTA=off, adapt_thresh=on, w_norm_target=12.5)
+
+1) baseline (c1_out=32, c2_out=64, greedy_n1=2500)
+- run_id=20260510T051713Z_a817e778353e → best_readout_acc=**0.309** | spikes/sample=63079.55 | assigned=636/16384 | winners_unique=237
+
+2) widen (c1_out=64, c2_out=128, greedy_n1=2500)
+- (попытка) run_id=20260510T065532Z_57ddeb24feac → ЗАВИС на i=896/5000 (17.92%), stage=collect_train_counts, updated_at=2026-05-10T08:36:42Z (summary.json не создан)
+- run_id=20260510T134240Z_57ddeb24feac → best_readout_acc=**0.326** | spikes/sample=126231.17 | assigned=638/32768 | winners_unique=236
+
+3) neurons (c1_out=32, c2_out=64, greedy_n1=5000)
+- run_id=20260510T155529Z_7207abc2991f → best_readout_acc=**0.314** | spikes/sample=63113.16 | assigned=637/16384 | winners_unique=235
+
+4) both (c1_out=64, c2_out=128, greedy_n1=5000)
+- run_id=20260510T173518Z_ace2c9f33fe6 → best_readout_acc=**0.322** | spikes/sample=126210.94 | assigned=632/32768 | winners_unique=238
+
+Итог Этап A: лучшая конфигурация = **widen (64/128, greedy_n1=2500)** → **0.326**.
+
+### Результат Этап B (N=20000) на лучшей конфигурации
+- widen (c1_out=64, c2_out=128, greedy_n1=2500), N=20000:
+  - run_id=20260510T192621Z_6b08c66d6220 → best_readout_acc=**0.325** | spikes/sample=126249.65 | assigned=634/32768 | winners_unique=236
+
+
+
+### 2026-05-02T20:01:07Z (20260502T200107Z_9c06d933fe14)
+- wta: True
+- ei: True
+- ei_inh: 120.0
+- ei_inh_mult_2layer: 0.01
+- spikes_per_sample: 43345.9618
+- assigned: 686/16384
+- best_acc: 0.186
+- error: None
+
+### 20260502T133156Z_9c06d933fe14 — failed
+- created_at: 2026-05-02T13:31:56Z
+- finished_at: 2026-05-02T13:42:44Z
+- config_hash: 9c06d933fe14
+- run_dir: runs_csnn/20260502T133156Z_9c06d933fe14
+- flags: arch="csnn" dataset="cifar100:20" device="cuda" time=100 N=5000 encoder="poisson" poisson_deterministic=true poisson_rate_scale=0.008 encoder_rate_boost=1 wta_enable=true ei_enable=true ei_exc=22.5 ei_inh=120 ei_inh_mult_2layer=0.01 adapt_thresh_enable=true greedy_enable=true greedy_n1=2500 w_norm_enable=true w_norm_target=12.5 c1_out=32 c1_kernel=5 c1_stride=1 c1_pad=2 c2_out=64 c2_kernel=3 c2_stride=2 c2_pad=1 activity_check_after=1000 activity_min_spikes_win_mean=1000
+- error: (RuntimeError) low activity: spikes_win_mean=27.380 < 1000.000 at i=1000 (in_spikes=945)
