@@ -438,6 +438,17 @@ def probe_readouts_counts(
     """
     N = n_hidden
 
+    # Accept numpy arrays / memmaps when counts were streamed to disk.
+    import numpy as np
+    if not torch.is_tensor(Xtr):
+        Xtr = torch.from_numpy(np.asarray(Xtr))
+    if not torch.is_tensor(Xte):
+        Xte = torch.from_numpy(np.asarray(Xte))
+    if not torch.is_tensor(ytr):
+        ytr = torch.from_numpy(np.asarray(ytr)).long()
+    if not torch.is_tensor(yte):
+        yte = torch.from_numpy(np.asarray(yte)).long()
+
     # 1) counts zscore + Linear
     Xtr_c = torch.log1p(Xtr[:, :N]); Xte_c = torch.log1p(Xte[:, :N])
     mu = Xtr_c.mean(0, keepdim=True); sd = Xtr_c.std(0, keepdim=True).clamp_min(1e-6)
@@ -573,9 +584,17 @@ def eval_readouts_from_net(
         net._use_memmap = True
         net._memmap_path = str(mm_dir / "Xtr.memmap")
 
+    # NOTE: batch_size=128 can OOM for large conv LIF layers at high T (e.g., CIFAR conv with T=300).
+    # Allow overriding via env without changing experiment configs.
+    counts_bs = 128
+    try:
+        counts_bs = int(os.environ.get("SNN_COUNTS_BATCH_SIZE", "128"))
+    except Exception:
+        counts_bs = 128
+
     Xtr, ytr = collect_counts_plus_fast(
         net, lif_layer, encoder, ds_train, n_train_counts,
-        T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
+        T=cfg.time, label_map=label_map, move_net=True, batch_size=counts_bs,
         encoder_rate_boost=cfg.encoder_rate_boost,
         spikes_transform=spikes_transform,
         device=dev,
@@ -587,7 +606,7 @@ def eval_readouts_from_net(
 
     Xte, yte = collect_counts_plus_fast(
         net, lif_layer, encoder, ds_test, n_test_counts,
-        T=cfg.time, label_map=label_map, move_net=True, batch_size=128,
+        T=cfg.time, label_map=label_map, move_net=True, batch_size=counts_bs,
         encoder_rate_boost=cfg.encoder_rate_boost,
         spikes_transform=spikes_transform,
         device=dev,
