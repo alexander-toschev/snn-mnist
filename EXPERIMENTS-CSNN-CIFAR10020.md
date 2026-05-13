@@ -399,3 +399,23 @@
 - run_dir: runs_csnn/20260502T133156Z_9c06d933fe14
 - flags: arch="csnn" dataset="cifar100:20" device="cuda" time=100 N=5000 encoder="poisson" poisson_deterministic=true poisson_rate_scale=0.008 encoder_rate_boost=1 wta_enable=true ei_enable=true ei_exc=22.5 ei_inh=120 ei_inh_mult_2layer=0.01 adapt_thresh_enable=true greedy_enable=true greedy_n1=2500 w_norm_enable=true w_norm_target=12.5 c1_out=32 c1_kernel=5 c1_stride=1 c1_pad=2 c2_out=64 c2_kernel=3 c2_stride=2 c2_pad=1 activity_check_after=1000 activity_min_spikes_win_mean=1000
 - error: (RuntimeError) low activity: spikes_win_mean=27.380 < 1000.000 at i=1000 (in_spikes=945)
+
+---
+
+## 2026-05-12/13 — Diverse10 (cifar100:0,1,2,3,5,8,13,14,17,19), WIDE 2-layer (c1=64,c2=128), local_inhib=0.85
+
+### TRAIN (T=300, rate_scale=0.0035, greedy_n1=2500, N=20000)
+- run_id=20260512T174140Z_de37f37d301e → status=ok (train+checkpoint+label_map), **readout не считался** (best_readout=null)
+  - spikes/sample≈209390.25 | winners_unique=230
+  - label_map assigned=628/32768
+
+### RESUME+EVAL (от 20260512T174140Z_de37f37d301e/model_after_train.pt)
+- Linear-only (без TFIDF):
+  - run_id=20260513T051258Z_027f24383bb5 → best_readout_acc=**0.319** (counts_zscore+Linear)
+  - label_map assigned=562/32768
+
+- TFIDF+MLP (env `SNN_READOUT_TFIDF_MLP=1`, skip label_map, memmap, batch_size=32):
+  - run_id=20260513T054352Z_027f24383bb5 → **best_readout_acc=0.3790 (TFIDF+MLP)**
+    - counts_zscore+Linear=0.318
+
+Примечание: фикс для memmap readout (torch.log1p на memmap) и env-оверрайд batch_size добавлены в `evaluation.py`.
